@@ -8,7 +8,7 @@ function Build()
   if tid then
     vim.cmd("norm G")
     local bc = build_config
-    local cmd = "jai main.jai -output_path build/"
+    local cmd = "jai first.jai -output_path build/"
     vim.fn.chansend(
       tid,
       cmd .. "\r\n"
@@ -35,7 +35,7 @@ function BuildAndRun()
   if tid then
     vim.cmd("norm G")
     local bc = build_config
-    local build_cmd = "jai main.jai -output_path build/"
+    local build_cmd = "jai first.jai -output_path build/"
     local run_cmd = "raddbg.exe --ipc launch_and_run"
     vim.fn.chansend(
       tid,
