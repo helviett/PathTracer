@@ -2,6 +2,8 @@
 #import "Windows";
 #import "dxgi";
 #import "d3d12"()(INCLUDE_DEBUG_BINDINGS = true);
+#import "File";
+#import "String";
 
 Window :: #import "Window_Creation";
 Input  :: #import "Input";
@@ -26,6 +28,8 @@ main :: () {
   if !result {
     return;
   }
+
+  compute_shader := load_shader_binary("compute.dxil");
 
   cpu_frame := CpuFrame.{
     fence = create_fence(*device),
@@ -82,6 +86,8 @@ main :: () {
   destroy(*device);
 }
 
+// Renderer
+
 gpu_frame_count : u32 : 2;
 
 GpuFrame :: struct
@@ -97,8 +103,24 @@ CpuFrame :: struct
   gpu_frame_index: u32;
 }
 
-Device :: struct
-{
+load_shader_binary :: (path: string) -> Shader, bool {
+  auto_release_temp();
+  compiled_shader_dir :: "compiled-shaders";
+  bytecode, success := read_entire_file(path_join(compiled_shader_dir, path,, allocator=temp));
+
+  if !success {
+    return .{}, false;
+  }
+
+  shader: Shader;
+  shader, success = create_shader(.{ code = bytecode, });
+
+  return shader, success;
+}
+
+// RHI
+
+Device :: struct {
   factory: *IDXGIFactory6;
   debug: *ID3D12Debug1;
   adapter: *IDXGIAdapter2;
@@ -112,36 +134,31 @@ Device :: struct
   sampler_descriptor_size: u32;
 }
 
-SwapchainDesc :: struct
-{
+SwapchainDesc :: struct {
   hwnd: HWND;
   width: u32;
   height: u32;
 };
 
-Swapchain :: struct
-{
+Swapchain :: struct {
   swapchain: *IDXGISwapChain3;
   textures: [3]Texture;
 }
 
-Cmd :: struct
-{
+Cmd :: struct {
   cmd: *ID3D12GraphicsCommandList7;
   device: *Device;
   allocator: *ID3D12CommandAllocator;
   rtv_heap: *ID3D12DescriptorHeap;
 }
 
-Fence :: struct
-{
+Fence :: struct {
   value: u64;
   fence: *ID3D12Fence;
   event: HANDLE;
 }
 
-SyncStage :: enum
-{
+SyncStage :: enum {
   None :: 0;
   Vertex :: 1 << 0;
   Pixel :: 1 << 1;
@@ -149,27 +166,23 @@ SyncStage :: enum
   Present :: 1 << 3;
 }
 
-TextureLayout :: enum
-{
+TextureLayout :: enum {
   Undefined;
   RenderTarget;
   Present;
 }
 
-LayoutTransition :: struct
-{
+LayoutTransition :: struct {
   texture: *Texture;
   before: TextureLayout;
   after: TextureLayout;
 }
 
-Texture :: struct
-{
+Texture :: struct {
   rsc: *ID3D12Resource;
 }
 
-Viewport :: struct
-{
+Viewport :: struct {
   x: float;
   y: float;
   width: float;
@@ -178,20 +191,26 @@ Viewport :: struct
   max_depth: float = 1;
 }
 
-Scissor :: struct
-{
+Scissor :: struct {
   x: u32;
   y: u32;
   width: u32;
   height: u32;
 }
 
-ClearColor :: struct
-{
+ClearColor :: struct {
   r: float;
   g: float;
   b: float;
   a: float;
+}
+
+ShaderDesc :: struct {
+  code: string;
+}
+
+Shader :: struct {
+  code: D3D12_SHADER_BYTECODE;
 }
 
 rif :: (res: HRESULT, msg: string) #expand {
@@ -575,4 +594,8 @@ next_value :: (fence: *Fence) -> u64 {
   fence.value = fence.value + 1;
 
   return fence.value;
+}
+
+create_shader :: (using desc: ShaderDesc) -> Shader, bool {
+  return .{ code = .{ code.data, xx code.count } }, true;
 }
