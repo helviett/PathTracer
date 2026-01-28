@@ -30,6 +30,19 @@ main :: () {
   }
 
   compute_shader := load_shader_binary("compute.dxil");
+  compute_pipeline := create_compute_pipeline(*device, .{ cs = *compute_shader, });
+
+  triangle_vs := load_shader_binary("triangle_vs.dxil");
+  triangle_ps := load_shader_binary("triangle_ps.dxil");
+
+  triangle_root_signature := create_root_signature(*device, *triangle_vs);
+
+  triangle_pipeline := create_graphics_pipeline(*device, .{
+    root_siganture = *triangle_root_signature,
+    vs = *triangle_vs,
+    ps = *triangle_ps,
+    render_target_formats = .[ .R8G8B8A8_UNORM, ],
+  });
 
   cpu_frame := CpuFrame.{
     fence = create_fence(*device),
@@ -44,6 +57,7 @@ main :: () {
 
   quit := false;
   while !quit { 
+      reset_temporary_storage();
       Input.update_window_events();
       for Input.events_this_frame {
           if it.type == .QUIT then quit = true;
@@ -53,7 +67,6 @@ main :: () {
       gpu_frame := *gpu_frames[gpu_frame_index];
       using gpu_frame;
       wait_for_fence(*device, *fence, fence_value);
-      print("Frame % Wait %\n", gpu_frame_index, fence_value);
       swapchain_texture := get_next_texture(*swapchain);
       begin(*cmd);
 
@@ -61,7 +74,13 @@ main :: () {
 
       set_viewport(*cmd, .{ width = width, height = height });
       set_scissor(*cmd, .{ width = width, height = height });
-      clear_rtv(*cmd, swapchain_texture, .{ r = 1, });
+      clear_rtv(*cmd, swapchain_texture, .{ });
+
+      set_render_targets(*cmd, .[swapchain_texture], null);
+
+      set_root_signature(*cmd, *triangle_root_signature);
+      set_pipeline(*cmd, *triangle_pipeline);
+      draw(*cmd, 3, 1, 0, 0);
 
       barrier(*cmd, .Raster, .Present, .[.{ texture = swapchain_texture, before = .RenderTarget, after = .Present, }]);
 
@@ -69,7 +88,6 @@ main :: () {
       submit(*device, *cmd);
       fence_value = next_value(*fence);
       signal(*device, *fence, fence_value);
-      print("Frame % Signal %\n", gpu_frame_index, fence_value);
       present(*swapchain);
       gpu_frame_index = (gpu_frame_index + 1) % gpu_frame_count;
   }
@@ -84,6 +102,11 @@ main :: () {
 
   destroy(*swapchain);
   destroy(*device);
+}
+
+
+align_pot :: inline (value: $T, alignment: T) -> T {
+  return (value + alignment - 1) & ~(alignment - 1);
 }
 
 // Renderer
@@ -109,6 +132,7 @@ load_shader_binary :: (path: string) -> Shader, bool {
   bytecode, success := read_entire_file(path_join(compiled_shader_dir, path,, allocator=temp));
 
   if !success {
+    print("Unable to load shader binary %", path);
     return .{}, false;
   }
 
@@ -150,6 +174,7 @@ Cmd :: struct {
   device: *Device;
   allocator: *ID3D12CommandAllocator;
   rtv_heap: *ID3D12DescriptorHeap;
+  dsv_heap: *ID3D12DescriptorHeap;
 }
 
 Fence :: struct {
@@ -211,6 +236,25 @@ ShaderDesc :: struct {
 
 Shader :: struct {
   code: D3D12_SHADER_BYTECODE;
+}
+
+RootSignature :: struct {
+  handle: *ID3D12RootSignature;
+}
+
+ComputePipelineDesc :: struct {
+  cs: *Shader;
+}
+
+GraphicsPipelineDesc :: struct {
+  root_siganture: *RootSignature;
+  vs: *Shader;
+  ps: *Shader;
+  render_target_formats: []DXGI_FORMAT;
+}
+
+Pipeline :: struct {
+  handle: *ID3D12PipelineState;
 }
 
 rif :: (res: HRESULT, msg: string) #expand {
@@ -294,6 +338,7 @@ create_device :: () -> Device, bool {
   };
 
   queue: *ID3D12CommandQueue;
+  cookie: u32;
 
   result = ID3D12Device_CreateCommandQueue(device, *queue_desc, *uid(ID3D12CommandQueue_UUID), xx *queue);
 
@@ -301,13 +346,13 @@ create_device :: () -> Device, bool {
 
   info_queue: *ID3D12InfoQueue1;
 
-  result = IUnknown_QueryInterface(device, *uid(ID3D12InfoQueue1_UUID), xx *info_queue);
+  if dxgi_factory_flags & DXGI_CREATE_FACTORY_DEBUG {
+    result = IUnknown_QueryInterface(device, *uid(ID3D12InfoQueue1_UUID), xx *info_queue);
 
-  rif(result, "Failed to acquire ID3D12InfoQueue1");
+    rif(result, "Failed to acquire ID3D12InfoQueue1");
 
-  cookie: u32;
-
-  result = ID3D12InfoQueue1_RegisterMessageCallback(info_queue, debug_callback, .FLAG_NONE, null, *cookie);
+    result = ID3D12InfoQueue1_RegisterMessageCallback(info_queue, debug_callback, .FLAG_NONE, null, *cookie);
+  }
 
   return .{
     factory = factory6,
@@ -407,17 +452,27 @@ create_cmd :: (device: *Device) -> Cmd, bool {
     Flags = .NONE,
     NodeMask = 0,
   };
-
   rtv_heap: *ID3D12DescriptorHeap;
   result = ID3D12Device_CreateDescriptorHeap(device.device, *rtv_heap_desc, *uid(ID3D12DescriptorHeap_UUID), xx *rtv_heap);
 
   rif(result, "Failed to create RTV ID3D12DescriptorHeap");
+
+
+  dsv_heap_desc := D3D12_DESCRIPTOR_HEAP_DESC.{
+    Type = .DSV,
+    NumDescriptors = 1,
+    Flags = .NONE,
+    NodeMask = 0,
+  };
+  dsv_heap: *ID3D12DescriptorHeap;
+  result = ID3D12Device_CreateDescriptorHeap(device.device, *dsv_heap_desc, *uid(ID3D12DescriptorHeap_UUID), xx *dsv_heap);
 
   return .{
     cmd = cmd_list,
     device = device,
     allocator = allocator,
     rtv_heap = rtv_heap,
+    dsv_heap = dsv_heap,
   }, true;
 }
 
@@ -429,6 +484,7 @@ destroy :: (device: *Device, cmd: *Cmd) {
 begin :: (cmd: *Cmd) {
   ID3D12CommandAllocator_Reset(cmd.allocator);
   ID3D12GraphicsCommandList_Reset(cmd.cmd, cmd.allocator, null);
+  ID3D12GraphicsCommandList_IASetPrimitiveTopology(cmd.cmd, .TRIANGLELIST);
 }
 
 end :: (cmd: *Cmd) {
@@ -550,6 +606,47 @@ clear_rtv :: (cmd: *Cmd, rtv: *Texture, clear_color: ClearColor) {
   ID3D12GraphicsCommandList_ClearRenderTargetView(cmd.cmd, handle, *d3d12_clear_color, 0, null);
 }
 
+set_render_targets :: (cmd: *Cmd, color_targets: []*Texture, depth_target: *Texture) {
+  rtv_head := ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(cmd.rtv_heap);
+  rtv_handle_ptr :*D3D12_CPU_DESCRIPTOR_HANDLE;
+
+  if color_targets {
+    rtv_handle_ptr = *rtv_head;
+
+    for color_targets {
+      handle := D3D12_CPU_DESCRIPTOR_HANDLE.{ ptr = rtv_head.ptr + cast(u64) it_index * cmd.device.rtv_descriptor_size };
+      ID3D12Device_CreateRenderTargetView(cmd.device.device, it.rsc, null, handle);
+    }
+  }
+
+  dsv_handle_ptr :*D3D12_CPU_DESCRIPTOR_HANDLE;
+
+  if depth_target {
+    handle := ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(cmd.dsv_heap);
+    ID3D12Device_CreateDepthStencilView(cmd.device.device, depth_target.rsc, null, handle);
+    dsv_handle_ptr = *handle;
+  }
+
+  ID3D12GraphicsCommandList_OMSetRenderTargets(cmd.cmd, xx color_targets.count, rtv_handle_ptr, .TRUE, dsv_handle_ptr);
+}
+
+set_root_signature :: (cmd: *Cmd, root_siganture: *RootSignature) {
+  ID3D12GraphicsCommandList_SetGraphicsRootSignature(cmd.cmd, root_siganture.handle);
+  ID3D12GraphicsCommandList_SetComputeRootSignature(cmd.cmd, root_siganture.handle);
+}
+
+set_pipeline :: (cmd: *Cmd, pipeline: *Pipeline) {
+  ID3D12GraphicsCommandList_SetPipelineState(cmd.cmd, pipeline.handle);
+}
+
+draw :: (cmd: *Cmd, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) {
+  ID3D12GraphicsCommandList_DrawInstanced(cmd.cmd, vertex_count, instance_count, first_vertex, first_instance);
+}
+
+draw_indexed :: (cmd: *Cmd, index_count: u32, instance_count: u32, first_index: u32, vertex_offset: s32, first_instance: u32) {
+  ID3D12GraphicsCommandList_DrawIndexedInstanced(cmd.cmd, index_count, instance_count, first_index, vertex_offset, first_instance);
+}
+
 submit :: (device: *Device, cmd: *Cmd) {
   ID3D12CommandQueue_ExecuteCommandLists(device.queue, 1, xx *cmd.cmd);
 }
@@ -598,4 +695,114 @@ next_value :: (fence: *Fence) -> u64 {
 
 create_shader :: (using desc: ShaderDesc) -> Shader, bool {
   return .{ code = .{ code.data, xx code.count } }, true;
+}
+
+create_root_signature :: (device: *Device, shader: *Shader) -> RootSignature, bool {
+  root_siganture: *ID3D12RootSignature;
+  result := ID3D12Device_CreateRootSignature(device.device, 0, shader.code.pShaderBytecode, shader.code.BytecodeLength, *uid(ID3D12RootSignature_UUID), xx *root_siganture);
+  rif(result, "Unable to create root signature");
+
+  return .{ handle = root_siganture, }, true;
+}
+
+create_compute_pipeline :: (device: *Device, using desc: ComputePipelineDesc) -> Pipeline, bool {
+  d3d12_desc := D3D12_COMPUTE_PIPELINE_STATE_DESC.{ CS = cs.code, };
+  pipeline: *ID3D12PipelineState;
+  ID3D12Device_CreateComputePipelineState(device.device, *d3d12_desc, *uid(ID3D12PipelineState_UUID), xx *pipeline);
+
+  return .{ handle = pipeline, }, true;
+}
+
+MAX_PIPELINE_STATE_STREAM_SIZE :: #run
+  align_pot(size_of(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) + size_of(*ID3D12RootSignature), size_of(*void))
+  // 2 Shaders at most.
+  + align_pot(size_of(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) + size_of(D3D12_SHADER_BYTECODE), size_of(*void))
+  + align_pot(size_of(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) + size_of(D3D12_SHADER_BYTECODE), size_of(*void))
+  + align_pot(size_of(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) + size_of(D3D12_BLEND_DESC), size_of(*void))
+  + align_pot(size_of(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) + size_of(u32), size_of(*void))
+  + align_pot(size_of(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) + size_of(D3D12_RASTERIZER_DESC2), size_of(*void))
+  + align_pot(size_of(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) + size_of(D3D12_DEPTH_STENCIL_DESC2), size_of(*void))
+  + align_pot(size_of(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) + size_of(D3D12_INPUT_LAYOUT_DESC), size_of(*void))
+  + align_pot(size_of(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) + size_of(D3D12_RT_FORMAT_ARRAY), size_of(*void))
+  + align_pot(size_of(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) + size_of(DXGI_FORMAT), size_of(*void))
+  + align_pot(size_of(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) + size_of(DXGI_SAMPLE_DESC), size_of(*void))
+  + align_pot(size_of(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) + size_of(D3D12_PRIMITIVE_TOPOLOGY_TYPE), size_of(*void))
+  + align_pot(size_of(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) + size_of(u32), size_of(*void));
+
+create_graphics_pipeline :: (device: *Device, using desc: GraphicsPipelineDesc) -> Pipeline, bool {
+  auto_release_temp();
+  stream_head : *u8 = alloc(MAX_PIPELINE_STATE_STREAM_SIZE,, allocator=temp);
+  stream_tail := stream_head;
+
+  write_stream :: (subobject: $T) #expand {
+    (cast(*T) stream_tail).* = subobject;
+    stream_tail += align_pot(size_of(T), size_of(*void));
+    assert((stream_tail - stream_head) <= MAX_PIPELINE_STATE_STREAM_SIZE);
+  }
+
+  if root_siganture {
+    so: struct { type := D3D12_PIPELINE_STATE_SUBOBJECT_TYPE.ROOT_SIGNATURE; root_signature: *ID3D12RootSignature; };
+    so.root_signature = root_siganture.handle;
+
+    write_stream(so);
+  }
+
+  if vs {
+    so: struct { type := D3D12_PIPELINE_STATE_SUBOBJECT_TYPE.VS; vs: D3D12_SHADER_BYTECODE; };
+    so.vs = vs.code;
+
+    write_stream(so);
+  }
+
+  if ps {
+    so: struct { type := D3D12_PIPELINE_STATE_SUBOBJECT_TYPE.PS; ps: D3D12_SHADER_BYTECODE; };
+    so.ps = ps.code;
+
+    write_stream(so);
+  }
+
+  if render_target_formats {
+    assert(render_target_formats.count <= 8);
+    so: struct { type := D3D12_PIPELINE_STATE_SUBOBJECT_TYPE.RENDER_TARGET_FORMATS; rtv_formats: D3D12_RT_FORMAT_ARRAY; };
+    so.rtv_formats.NumRenderTargets = xx render_target_formats.count;
+
+    for render_target_formats {
+      so.rtv_formats.RTFormats[it_index] = it;
+    }
+
+    write_stream(so);
+  }
+
+  {
+    so: struct { type := D3D12_PIPELINE_STATE_SUBOBJECT_TYPE.PRIMITIVE_TOPOLOGY; topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE; };
+    so.topology = .TRIANGLE;
+
+    write_stream(so);
+  }
+
+  {
+    so: struct { type := D3D12_PIPELINE_STATE_SUBOBJECT_TYPE.RASTERIZER2; rasterizer: D3D12_RASTERIZER_DESC2; };
+    so.rasterizer = .{
+      FillMode = .SOLID,
+      CullMode = .BACK,
+      FrontCounterClockwise = .TRUE,
+      DepthClipEnable = .TRUE,
+    };
+
+
+    write_stream(so);
+  }
+
+  pipeline_stream := D3D12_PIPELINE_STATE_STREAM_DESC.{
+    SizeInBytes = xx (stream_tail - stream_head),
+    pPipelineStateSubobjectStream = stream_head,
+  };
+
+  pipeline: *ID3D12PipelineState;
+
+
+  result := ID3D12Device2_CreatePipelineState(device.device, *pipeline_stream, *uid(ID3D12PipelineState_UUID), xx *pipeline);
+  rif(result, "Unable to create pipeline");
+
+  return .{ handle = pipeline, }, true;
 }

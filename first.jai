@@ -27,15 +27,33 @@ compile_shaders :: () {
   make_directory_if_it_does_not_exist(pdb_dir);
   make_directory_if_it_does_not_exist(compiled_shader_dir);
 
-  compute_desc := ShaderDescription.{
-    path = #run path_join(shader_dir, "compute.hlsl"),
-    output_path = #run path_join(compiled_shader_dir, "compute.dxil"),
-    stage = .Compute,
-    debug = true,
-    pdb_dir = pdb_dir,
-  };
-  compile_shader_and_save_on_disk(compute_desc);
+  shader_descriptions := ShaderDescription.[
+    .{
+      path = #run path_join(shader_dir, "compute.hlsl"),
+      output_path = #run path_join(compiled_shader_dir, "compute.dxil"),
+      stage = .Compute,
+      debug = true,
+      pdb_dir = pdb_dir,
+    },
+    .{
+      path = #run path_join(shader_dir, "triangle.hlsl"),
+      output_path = #run path_join(compiled_shader_dir, "triangle_vs.dxil"),
+      stage = .Vertex,
+      debug = true,
+      pdb_dir = pdb_dir,
+    },
+    .{
+      path = #run path_join(shader_dir, "triangle.hlsl"),
+      output_path = #run path_join(compiled_shader_dir, "triangle_ps.dxil"),
+      stage = .Pixel,
+      debug = true,
+      pdb_dir = pdb_dir,
+    }
+  ];
 
+  for shader_descriptions {
+    compile_shader_and_save_on_disk(it);
+  }
 }
 
 #if AT_COMPILE_TIME {
