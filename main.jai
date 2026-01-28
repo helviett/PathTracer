@@ -4,6 +4,7 @@
 #import "d3d12"()(INCLUDE_DEBUG_BINDINGS = true);
 #import "File";
 #import "String";
+#import "object-pool";
 
 Window :: #import "Window_Creation";
 Input  :: #import "Input";
@@ -29,18 +30,18 @@ main :: () {
     return;
   }
 
-  compute_shader := load_shader_binary("compute.dxil");
-  compute_pipeline := create_compute_pipeline(*device, .{ cs = *compute_shader, });
+  compute_shader := load_shader_binary(*device, "compute.dxil");
+  compute_pipeline := create_compute_pipeline(*device, .{ cs = compute_shader, });
 
-  triangle_vs := load_shader_binary("triangle_vs.dxil");
-  triangle_ps := load_shader_binary("triangle_ps.dxil");
+  triangle_vs := load_shader_binary(*device, "triangle_vs.dxil");
+  triangle_ps := load_shader_binary(*device, "triangle_ps.dxil");
 
-  triangle_root_signature := create_root_signature(*device, *triangle_vs);
+  triangle_root_signature := create_root_signature(*device, triangle_vs);
 
   triangle_pipeline := create_graphics_pipeline(*device, .{
-    root_siganture = *triangle_root_signature,
-    vs = *triangle_vs,
-    ps = *triangle_ps,
+    root_siganture = triangle_root_signature,
+    vs = triangle_vs,
+    ps = triangle_ps,
     render_target_formats = .[ .R8G8B8A8_UNORM, ],
   });
 
@@ -76,10 +77,10 @@ main :: () {
       set_scissor(*cmd, .{ width = width, height = height });
       clear_rtv(*cmd, swapchain_texture, .{ });
 
-      set_render_targets(*cmd, .[swapchain_texture], null);
+      set_render_targets(*cmd, .[swapchain_texture], xx null_handle);
 
-      set_root_signature(*cmd, *triangle_root_signature);
-      set_pipeline(*cmd, *triangle_pipeline);
+      set_root_signature(*cmd, triangle_root_signature);
+      set_pipeline(*cmd, triangle_pipeline);
       draw(*cmd, 3, 1, 0, 0);
 
       barrier(*cmd, .Raster, .Present, .[.{ texture = swapchain_texture, before = .RenderTarget, after = .Present, }]);
@@ -126,23 +127,28 @@ CpuFrame :: struct
   gpu_frame_index: u32;
 }
 
-load_shader_binary :: (path: string) -> Shader, bool {
+load_shader_binary :: (device: *Device, path: string) -> Shader, bool {
   auto_release_temp();
   compiled_shader_dir :: "compiled-shaders";
   bytecode, success := read_entire_file(path_join(compiled_shader_dir, path,, allocator=temp));
 
   if !success {
     print("Unable to load shader binary %", path);
-    return .{}, false;
+    return xx null_handle, false;
   }
 
   shader: Shader;
-  shader, success = create_shader(.{ code = bytecode, });
+  shader, success = create_shader(device, .{ code = bytecode, });
 
   return shader, success;
 }
 
 // RHI
+
+Texture       :: #type, isa Handle;
+Pipeline      :: #type, isa Handle;
+Shader        :: #type, isa Handle;
+RootSignature :: #type, isa Handle;
 
 Device :: struct {
   factory: *IDXGIFactory6;
@@ -156,6 +162,10 @@ Device :: struct {
   dsv_descriptor_size: u32;
   cbv_srv_uav_descriptor_size: u32;
   sampler_descriptor_size: u32;
+  textures: ObjectPool(TextureD3D12, Texture);
+  pipelines: ObjectPool(PipelineD3D12, Pipeline);
+  shaders: ObjectPool(ShaderD3D12, Shader);
+  root_sigantures: ObjectPool(RootSignatureD3D12, RootSignature);
 }
 
 SwapchainDesc :: struct {
@@ -165,8 +175,9 @@ SwapchainDesc :: struct {
 };
 
 Swapchain :: struct {
-  swapchain: *IDXGISwapChain3;
+  handle: *IDXGISwapChain3;
   textures: [3]Texture;
+  device: *Device;
 }
 
 Cmd :: struct {
@@ -198,12 +209,12 @@ TextureLayout :: enum {
 }
 
 LayoutTransition :: struct {
-  texture: *Texture;
+  texture: Texture;
   before: TextureLayout;
   after: TextureLayout;
 }
 
-Texture :: struct {
+TextureD3D12 :: struct {
   rsc: *ID3D12Resource;
 }
 
@@ -234,26 +245,26 @@ ShaderDesc :: struct {
   code: string;
 }
 
-Shader :: struct {
+ShaderD3D12 :: struct {
   code: D3D12_SHADER_BYTECODE;
 }
 
-RootSignature :: struct {
+RootSignatureD3D12 :: struct {
   handle: *ID3D12RootSignature;
 }
 
 ComputePipelineDesc :: struct {
-  cs: *Shader;
+  cs: Shader = xx null_handle;
 }
 
 GraphicsPipelineDesc :: struct {
-  root_siganture: *RootSignature;
-  vs: *Shader;
-  ps: *Shader;
+  root_siganture: RootSignature;
+  vs: Shader = xx null_handle;
+  ps: Shader = xx null_handle;
   render_target_formats: []DXGI_FORMAT;
 }
 
-Pipeline :: struct {
+PipelineD3D12 :: struct {
   handle: *ID3D12PipelineState;
 }
 
@@ -261,6 +272,13 @@ rif :: (res: HRESULT, msg: string) #expand {
   if FAILED(res) {
     print("Error 0x%: %", FormatInt.{value = cast, no_check(u32) res, base = 16}, msg);
     `return .{}, true;
+  }
+}
+
+rif_handle :: (res: HRESULT, msg: string) #expand {
+  if FAILED(res) {
+    print("Error 0x%: %", FormatInt.{value = cast, no_check(u32) res, base = 16}, msg);
+    `return xx null_handle, true;
   }
 }
 
@@ -375,6 +393,9 @@ destroy :: (device: *Device) -> () {
   release(device.adapter);
   release(device.factory);
   release(device.debug);
+
+  assert(device.textures.objects.count == 0);
+  reset(*device.textures);
 }
 
 create_swapchain :: (device: *Device, desc: SwapchainDesc) -> Swapchain, bool {
@@ -414,27 +435,34 @@ create_swapchain :: (device: *Device, desc: SwapchainDesc) -> Swapchain, bool {
   rif(result, "Unable to associate window with swapchain");
 
   swapchain := Swapchain.{
-    swapchain = dxgi_swapchain3,
+    device = device,
+    handle = dxgi_swapchain3,
   };
 
   for 0..2 {
-    IDXGISwapChain_GetBuffer(dxgi_swapchain, xx it, *uid(ID3D12Resource_UUID), xx *swapchain.textures[it].rsc);
+    texture: TextureD3D12;
+    IDXGISwapChain_GetBuffer(dxgi_swapchain, xx it, *uid(ID3D12Resource_UUID), xx *texture.rsc);
+    swapchain.textures[it] = add_object(*device.textures, texture);
   }
 
   return swapchain, true;
 }
 
-destroy :: (swapchain: *Swapchain) {
-  release(swapchain.swapchain);
+destroy :: (using swapchain: *Swapchain) {
+  for textures {
+    remove_object(*device.textures, it);
+  }
+
+  release(handle);
 }
 
-present :: (swapchain: *Swapchain) {
-  IDXGISwapChain_Present(swapchain.swapchain, 1, 0);
+present :: (using swapchain: *Swapchain) {
+  IDXGISwapChain_Present(handle, 1, 0);
 }
 
-get_next_texture :: (swapchain: *Swapchain) -> *Texture {
-  idx := IDXGISwapChain3_GetCurrentBackBufferIndex(swapchain.swapchain);
-  return *swapchain.textures[idx];
+get_next_texture :: (using swapchain: *Swapchain) -> Texture {
+  idx := IDXGISwapChain3_GetCurrentBackBufferIndex(handle);
+  return textures[idx];
 }
 
 create_cmd :: (device: *Device) -> Cmd, bool {
@@ -590,7 +618,7 @@ barrier :: (cmd: *Cmd, before: SyncStage, after: SyncStage, layout_transitions: 
       b.AccessAfter = global_barrier.AccessAfter;
       b.LayoutBefore = layout_to_d3d12_layout(t.before);
       b.LayoutAfter = layout_to_d3d12_layout(t.after);
-      b.pResource = t.texture.rsc;
+      b.pResource = get_object(cmd.device.textures, t.texture).rsc;
       b.Subresources.IndexOrFirstMipLevel = 0xFFFFFFFF;
     }
   }
@@ -598,15 +626,17 @@ barrier :: (cmd: *Cmd, before: SyncStage, after: SyncStage, layout_transitions: 
   ID3D12GraphicsCommandList7_Barrier(cmd.cmd, group_count, *groups[0]);
 }
 
-clear_rtv :: (cmd: *Cmd, rtv: *Texture, clear_color: ClearColor) {
+clear_rtv :: (cmd: *Cmd, rtv: Texture, clear_color: ClearColor) {
+  d3d12_rtv := get_object(cmd.device.textures, rtv);
+
   handle := ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(cmd.rtv_heap);
-  ID3D12Device_CreateRenderTargetView(cmd.device.device, rtv.rsc, null, handle);
+  ID3D12Device_CreateRenderTargetView(cmd.device.device, d3d12_rtv.rsc, null, handle);
   d3d12_clear_color := float.[clear_color.r, clear_color.g, clear_color.b, clear_color.a];
 
   ID3D12GraphicsCommandList_ClearRenderTargetView(cmd.cmd, handle, *d3d12_clear_color, 0, null);
 }
 
-set_render_targets :: (cmd: *Cmd, color_targets: []*Texture, depth_target: *Texture) {
+set_render_targets :: (cmd: *Cmd, color_targets: []Texture, depth_target: Texture) {
   rtv_head := ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(cmd.rtv_heap);
   rtv_handle_ptr :*D3D12_CPU_DESCRIPTOR_HANDLE;
 
@@ -615,28 +645,31 @@ set_render_targets :: (cmd: *Cmd, color_targets: []*Texture, depth_target: *Text
 
     for color_targets {
       handle := D3D12_CPU_DESCRIPTOR_HANDLE.{ ptr = rtv_head.ptr + cast(u64) it_index * cmd.device.rtv_descriptor_size };
-      ID3D12Device_CreateRenderTargetView(cmd.device.device, it.rsc, null, handle);
+      d3d12_color_target := get_object(cmd.device.textures, it);
+      ID3D12Device_CreateRenderTargetView(cmd.device.device, d3d12_color_target.rsc, null, handle);
     }
   }
 
   dsv_handle_ptr :*D3D12_CPU_DESCRIPTOR_HANDLE;
 
-  if depth_target {
+  if depth_target != xx null_handle {
     handle := ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(cmd.dsv_heap);
-    ID3D12Device_CreateDepthStencilView(cmd.device.device, depth_target.rsc, null, handle);
+    d3d12_depth_target := get_object(cmd.device.textures, depth_target);
+    ID3D12Device_CreateDepthStencilView(cmd.device.device, d3d12_depth_target.rsc, null, handle);
     dsv_handle_ptr = *handle;
   }
 
   ID3D12GraphicsCommandList_OMSetRenderTargets(cmd.cmd, xx color_targets.count, rtv_handle_ptr, .TRUE, dsv_handle_ptr);
 }
 
-set_root_signature :: (cmd: *Cmd, root_siganture: *RootSignature) {
-  ID3D12GraphicsCommandList_SetGraphicsRootSignature(cmd.cmd, root_siganture.handle);
-  ID3D12GraphicsCommandList_SetComputeRootSignature(cmd.cmd, root_siganture.handle);
+set_root_signature :: (cmd: *Cmd, root_siganture: RootSignature) {
+  handle: *ID3D12RootSignature = get_object(cmd.device.root_sigantures, root_siganture).handle;
+  ID3D12GraphicsCommandList_SetGraphicsRootSignature(cmd.cmd, handle);
+  ID3D12GraphicsCommandList_SetComputeRootSignature(cmd.cmd, handle);
 }
 
-set_pipeline :: (cmd: *Cmd, pipeline: *Pipeline) {
-  ID3D12GraphicsCommandList_SetPipelineState(cmd.cmd, pipeline.handle);
+set_pipeline :: (cmd: *Cmd, pipeline: Pipeline) {
+  ID3D12GraphicsCommandList_SetPipelineState(cmd.cmd, get_object(cmd.device.pipelines, pipeline).handle);
 }
 
 draw :: (cmd: *Cmd, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) {
@@ -693,24 +726,26 @@ next_value :: (fence: *Fence) -> u64 {
   return fence.value;
 }
 
-create_shader :: (using desc: ShaderDesc) -> Shader, bool {
-  return .{ code = .{ code.data, xx code.count } }, true;
+create_shader :: (device: *Device, using desc: ShaderDesc) -> Shader, bool {
+  return add_object(*device.shaders, .{ code = .{ code.data, xx code.count } }), true;
 }
 
-create_root_signature :: (device: *Device, shader: *Shader) -> RootSignature, bool {
+create_root_signature :: (device: *Device, shader: Shader) -> RootSignature, bool {
   root_siganture: *ID3D12RootSignature;
-  result := ID3D12Device_CreateRootSignature(device.device, 0, shader.code.pShaderBytecode, shader.code.BytecodeLength, *uid(ID3D12RootSignature_UUID), xx *root_siganture);
-  rif(result, "Unable to create root signature");
+  d3d12_shader := get_object(device.shaders, shader);
+  result := ID3D12Device_CreateRootSignature(device.device, 0, d3d12_shader.code.pShaderBytecode, d3d12_shader.code.BytecodeLength, *uid(ID3D12RootSignature_UUID), xx *root_siganture);
+  rif_handle(result, "Unable to create root signature");
 
-  return .{ handle = root_siganture, }, true;
+  return add_object(*device.root_sigantures, .{ handle = root_siganture, }), true;
 }
 
 create_compute_pipeline :: (device: *Device, using desc: ComputePipelineDesc) -> Pipeline, bool {
-  d3d12_desc := D3D12_COMPUTE_PIPELINE_STATE_DESC.{ CS = cs.code, };
+  d3d12_shader := get_object(device.shaders, cs);
+  d3d12_desc := D3D12_COMPUTE_PIPELINE_STATE_DESC.{ CS = d3d12_shader.code, };
   pipeline: *ID3D12PipelineState;
   ID3D12Device_CreateComputePipelineState(device.device, *d3d12_desc, *uid(ID3D12PipelineState_UUID), xx *pipeline);
 
-  return .{ handle = pipeline, }, true;
+  return add_object(*device.pipelines, .{ handle = pipeline }), true;
 }
 
 MAX_PIPELINE_STATE_STREAM_SIZE :: #run
@@ -740,23 +775,26 @@ create_graphics_pipeline :: (device: *Device, using desc: GraphicsPipelineDesc) 
     assert((stream_tail - stream_head) <= MAX_PIPELINE_STATE_STREAM_SIZE);
   }
 
-  if root_siganture {
+  if root_siganture != xx null_handle {
+    d3d12_root_signature := get_object(device.root_sigantures, root_siganture);
     so: struct { type := D3D12_PIPELINE_STATE_SUBOBJECT_TYPE.ROOT_SIGNATURE; root_signature: *ID3D12RootSignature; };
-    so.root_signature = root_siganture.handle;
+    so.root_signature = d3d12_root_signature.handle;
 
     write_stream(so);
   }
 
-  if vs {
+  if vs != xx null_handle {
+    d3d12_vs := get_object(device.shaders, vs);
     so: struct { type := D3D12_PIPELINE_STATE_SUBOBJECT_TYPE.VS; vs: D3D12_SHADER_BYTECODE; };
-    so.vs = vs.code;
+    so.vs = d3d12_vs.code;
 
     write_stream(so);
   }
 
-  if ps {
+  if ps != xx null_handle {
+    d3d12_ps := get_object(device.shaders, ps);
     so: struct { type := D3D12_PIPELINE_STATE_SUBOBJECT_TYPE.PS; ps: D3D12_SHADER_BYTECODE; };
-    so.ps = ps.code;
+    so.ps = d3d12_ps.code;
 
     write_stream(so);
   }
@@ -802,7 +840,14 @@ create_graphics_pipeline :: (device: *Device, using desc: GraphicsPipelineDesc) 
 
 
   result := ID3D12Device2_CreatePipelineState(device.device, *pipeline_stream, *uid(ID3D12PipelineState_UUID), xx *pipeline);
-  rif(result, "Unable to create pipeline");
+  rif_handle(result, "Unable to create pipeline");
 
-  return .{ handle = pipeline, }, true;
+  return add_object(*device.pipelines, .{ handle = pipeline, }), true;
+}
+
+destroy :: (device: *Device, pipeline: Pipeline) {
+  d3d12_pipeline, removed := remove_object(*device.pipelines, pipeline);
+  assert(removed);
+
+  release(d3d12_pipeline.handle);
 }
