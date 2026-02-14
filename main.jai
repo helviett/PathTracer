@@ -5,6 +5,7 @@
 #import "File";
 #import "String";
 #import "object-pool";
+#import "allocators";
 
 Window :: #import "Window_Creation";
 Input  :: #import "Input";
@@ -42,7 +43,19 @@ main :: () {
     root_siganture = triangle_root_signature,
     vs = triangle_vs,
     ps = triangle_ps,
-    render_target_formats = .[ .R8G8B8A8_UNORM, ],
+    render_target_formats = .[ .r8g8b8a8_unorm_srgb, ],
+  });
+
+  heap_size: u64 = 1024 * 1024 * 1024;
+  heap := create_memory_heap(*device, .{ heap_type = .DEFAULT, size = heap_size, });
+  resource_allocator: ResourceAllocator;
+  init(*resource_allocator, *device, heap, heap_size);
+
+  color_target := create_texture(*resource_allocator, .{
+    format = .r8g8b8a8_unorm_srgb,
+    width = width,
+    height = height,
+    usage = .ALLOW_RENDER_TARGET,
   });
 
   cpu_frame := CpuFrame.{
@@ -57,7 +70,7 @@ main :: () {
   }
 
   quit := false;
-  while !quit { 
+  while !quit {
       reset_temporary_storage();
       Input.update_window_events();
       for Input.events_this_frame {
@@ -71,19 +84,32 @@ main :: () {
       swapchain_texture := get_next_texture(*swapchain);
       begin(*cmd);
 
-      barrier(*cmd, .Present, .Raster, .[.{ texture = swapchain_texture, before = .Present, after = .RenderTarget, }]);
+      barrier(*cmd, .Present, .Raster | .Copy, .[
+        .{ texture = swapchain_texture, before = .Present, after = .CopyTarget, },
+        .{ texture = color_target, before = .Undefined, after = .RenderTarget, },
+        ]
+      );
 
       set_viewport(*cmd, .{ width = width, height = height });
       set_scissor(*cmd, .{ width = width, height = height });
-      clear_rtv(*cmd, swapchain_texture, .{ });
+      clear_rtv(*cmd, color_target, .{ });
 
-      set_render_targets(*cmd, .[swapchain_texture], xx null_handle);
+      set_render_targets(*cmd, .[color_target], xx null_handle);
 
       set_root_signature(*cmd, triangle_root_signature);
       set_pipeline(*cmd, triangle_pipeline);
       draw(*cmd, 3, 1, 0, 0);
 
-      barrier(*cmd, .Raster, .Present, .[.{ texture = swapchain_texture, before = .RenderTarget, after = .Present, }]);
+      barrier(*cmd, .Raster, .Copy, .[.{ texture = color_target, before = .RenderTarget, after = .CopySource, }]);
+
+      copy(*cmd, TextureCopy.{
+        dst = swapchain_texture,
+        src =  color_target,
+        width = width,
+        height = height,
+      });
+
+      barrier(*cmd, .Copy, .Present, .[.{ texture = swapchain_texture, before = .CopyTarget, after = .Present, }]);
 
       end(*cmd);
       submit(*device, *cmd);
@@ -103,11 +129,6 @@ main :: () {
 
   destroy(*swapchain);
   destroy(*device);
-}
-
-
-align_pot :: inline (value: $T, alignment: T) -> T {
-  return (value + alignment - 1) & ~(alignment - 1);
 }
 
 // Renderer
@@ -143,12 +164,44 @@ load_shader_binary :: (device: *Device, path: string) -> Shader, bool {
   return shader, success;
 }
 
+ResourceAllocator :: struct {
+  offset_allocator: LinearAllocator;
+  memory_heap: MemoryHeap;
+  device: *Device;
+}
+
+init :: (allocator: *ResourceAllocator, device: *Device, heap: MemoryHeap, size: u64) {
+  init(*allocator.offset_allocator, size);
+  allocator.device = device;
+  allocator.memory_heap = heap;
+}
+
+create_texture :: (using allocator: *ResourceAllocator, texture_desc: TextureDesc) -> Texture, bool {
+  requirements := get_texture_allocation_requirements(device, texture_desc);
+  allocation := alloc(*offset_allocator, requirements.size, requirements.alignment);
+  texture, success := create_texture(device, .{ heap = memory_heap, offset = allocation.offset }, texture_desc);
+
+  return texture, success;
+}
+
+create_buffer :: (using allocator: *ResourceAllocator, buffer_desc: BufferDesc) -> Buffer, bool {
+  requirements := get_buffer_allocation_requirements(device, buffer_desc);
+  allocation := alloc(*offset_allocator, requirements.size, requirements.alignment);
+  buffer, success := create_buffer(device, .{ heap = memory_heap, offset = allocation.offset }, buffer_desc);
+
+  return buffer, success;
+}
+
+// TODO: proper deallocation once any allocator with free implementation arrives.
+
 // RHI
 
 Texture       :: #type, isa Handle;
+Buffer        :: #type, isa Handle;
 Pipeline      :: #type, isa Handle;
 Shader        :: #type, isa Handle;
 RootSignature :: #type, isa Handle;
+MemoryHeap    :: #type, isa Handle;
 
 Device :: struct {
   factory: *IDXGIFactory6;
@@ -156,16 +209,18 @@ Device :: struct {
   adapter: *IDXGIAdapter2;
   queue: *ID3D12CommandQueue;
   info_queue: *ID3D12InfoQueue1;
-  device: *ID3D12Device5;
+  device: *ID3D12Device10;
   cookie: u32;
   rtv_descriptor_size: u32;
   dsv_descriptor_size: u32;
   cbv_srv_uav_descriptor_size: u32;
   sampler_descriptor_size: u32;
   textures: ObjectPool(TextureD3D12, Texture);
+  buffers: ObjectPool(BufferD3D12, Buffer);
   pipelines: ObjectPool(PipelineD3D12, Pipeline);
   shaders: ObjectPool(ShaderD3D12, Shader);
   root_sigantures: ObjectPool(RootSignatureD3D12, RootSignature);
+  memory_heaps: ObjectPool(MemoryHeapD3D12, MemoryHeap);
 }
 
 SwapchainDesc :: struct {
@@ -199,12 +254,15 @@ SyncStage :: enum {
   Vertex :: 1 << 0;
   Pixel :: 1 << 1;
   Raster :: 1 << 2;
-  Present :: 1 << 3;
+  Copy :: 1 << 3;
+  Present :: 1 << 4;
 }
 
 TextureLayout :: enum {
   Undefined;
   RenderTarget;
+  CopySource;
+  CopyTarget;
   Present;
 }
 
@@ -214,8 +272,31 @@ LayoutTransition :: struct {
   after: TextureLayout;
 }
 
+TextureDesc :: struct {
+  format: Format;
+  width: u32;
+  height: u32;
+  usage: D3D12_RESOURCE_FLAGS;
+}
+
+BufferDesc :: struct {
+  size: u64;
+  usage: D3D12_RESOURCE_FLAGS;
+}
+
 TextureD3D12 :: struct {
-  rsc: *ID3D12Resource;
+  format: Format;
+  mip_count: u16 = 1;
+  array_count: u16 = 1;
+  width: u32;
+  height: u32;
+  memory: Memory;
+  handle: *ID3D12Resource;
+}
+
+BufferD3D12 :: struct {
+  memory: Memory;
+  handle: *ID3D12Resource;
 }
 
 Viewport :: struct {
@@ -261,11 +342,108 @@ GraphicsPipelineDesc :: struct {
   root_siganture: RootSignature;
   vs: Shader = xx null_handle;
   ps: Shader = xx null_handle;
-  render_target_formats: []DXGI_FORMAT;
+  render_target_formats: []Format;
 }
 
 PipelineD3D12 :: struct {
   handle: *ID3D12PipelineState;
+}
+
+MemoryHeapDesc :: struct {
+  heap_type: D3D12_HEAP_TYPE;
+  size: u64;
+}
+
+MemoryHeapD3D12 :: struct {
+  handle: *ID3D12Heap;
+}
+
+AllocationRequirements :: struct {
+  alignment: u64;
+  size: u64;
+}
+
+Memory :: struct {
+  heap: MemoryHeap;
+  offset: u64;
+}
+
+BufferCopy :: struct {
+  dst: Buffer;
+  dst_offset: u64;
+  src: Buffer;
+  src_offset: u64;
+  size: u64;
+}
+
+TextureCopy :: struct {
+  dst: Texture;
+  dst_subresource: TextureSubresource;
+  dst_x: u32;
+  dst_y: u32;
+  src: Texture;
+  src_subresource: TextureSubresource;
+  src_x: u32;
+  src_y: u32;
+  width: u32;
+  height: u32;
+}
+
+BufferToTextureCopy :: struct {
+  buffer: Buffer;
+  buffer_offset: u64;
+  texture: Texture;
+  texture_subresource: TextureSubresource;
+  texture_x: u32;
+  texture_y: u32;
+  width: u32;
+  height: u32;
+}
+
+TextureToBufferCopy :: #type, distinct BufferToTextureCopy;
+
+TextureSubresource :: struct {
+  mip_index: u16;
+  array_index: u16;
+}
+
+Format :: enum {
+  unknown;
+  r8g8b8a8_unorm;
+  r8g8b8a8_unorm_srgb;
+}
+
+FormatDesc :: struct {
+  bytes_per_block: u32;
+}
+
+get_format_desc :: inline (format: Format) -> FormatDesc {
+  if #complete format == {
+    case .unknown;
+      return .{};
+    case .r8g8b8a8_unorm; #through;
+    case .r8g8b8a8_unorm_srgb;
+      return .{ bytes_per_block = 4 };
+  }
+}
+
+format_to_dxgi :: inline (format: Format) -> DXGI_FORMAT {
+  if #complete format == {
+    case .unknown; return .UNKNOWN;
+    case .r8g8b8a8_unorm; return .R8G8B8A8_UNORM;
+    case .r8g8b8a8_unorm_srgb; return .R8G8B8A8_UNORM_SRGB;
+  }
+}
+
+dxgi_to_format :: inline (dxgi: DXGI_FORMAT) -> Format {
+  if dxgi == {
+    case .UNKNOWN; return .unknown;
+    case .R8G8B8A8_UNORM; return .r8g8b8a8_unorm;
+    case .R8G8B8A8_UNORM_SRGB; return .r8g8b8a8_unorm_srgb;
+  }
+
+  assert(false);
+  return .unknown;
 }
 
 rif :: (res: HRESULT, msg: string) #expand {
@@ -336,11 +514,11 @@ create_device :: () -> Device, bool {
     adapter_index += 1;
   }
 
-  device: *ID3D12Device5;
+  device: *ID3D12Device10;
 
-  result = D3D12CreateDevice(adapter, .D3D_FEATURE_LEVEL_12_2, *uid(ID3D12Device5_UUID), xx *device);
+  result = D3D12CreateDevice(adapter, .D3D_FEATURE_LEVEL_12_2, *uid(ID3D12Device10_UUID), xx *device);
 
-  rif(result, "Failed to create ID3D12Device5");
+  rif(result, "Failed to create ID3D12Device10");
 
   options12: D3D12_FEATURE_DATA_D3D12_OPTIONS12;
 
@@ -399,10 +577,11 @@ destroy :: (device: *Device) -> () {
 }
 
 create_swapchain :: (device: *Device, desc: SwapchainDesc) -> Swapchain, bool {
+  format :: Format.r8g8b8a8_unorm;
   dxgi_desc := DXGI_SWAP_CHAIN_DESC1.{
     Width = desc.width,
     Height = desc.height,
-    Format = .R8G8B8A8_UNORM,
+    Format = format_to_dxgi(format),
     SampleDesc.Count = 1,
     BufferUsage = .RENDER_TARGET_OUTPUT,
     BufferCount = 3,
@@ -440,8 +619,11 @@ create_swapchain :: (device: *Device, desc: SwapchainDesc) -> Swapchain, bool {
   };
 
   for 0..2 {
-    texture: TextureD3D12;
-    IDXGISwapChain_GetBuffer(dxgi_swapchain, xx it, *uid(ID3D12Resource_UUID), xx *texture.rsc);
+    texture := TextureD3D12.{
+      width = desc.width,
+      height = desc.height,
+    };
+    IDXGISwapChain_GetBuffer(dxgi_swapchain, xx it, *uid(ID3D12Resource_UUID), xx *texture.handle);
     swapchain.textures[it] = add_object(*device.textures, texture);
   }
 
@@ -567,6 +749,11 @@ sync_stage_to_d3d12_sync_and_access :: (stage: SyncStage) -> D3D12_BARRIER_SYNC,
     access |= .RENDER_TARGET;
   }
 
+  if stage & .Copy {
+    sync |= .COPY;
+    access |= .COPY_SOURCE | .COPY_DEST;
+  }
+
   if stage & .Present {
     access = .NO_ACCESS;
   }
@@ -580,8 +767,75 @@ layout_to_d3d12_layout :: (layout: TextureLayout) -> D3D12_BARRIER_LAYOUT {
   if #complete layout == {
     case .Undefined; return .UNDEFINED;
     case .RenderTarget; return .RENDER_TARGET;
+    case .CopySource; return .COPY_SOURCE;
+    case .CopyTarget; return .COPY_DEST;
     case .Present; return .PRESENT;
   }
+}
+
+keep_compatible_access :: inline (layout: D3D12_BARRIER_LAYOUT, access: D3D12_BARRIER_ACCESS) -> D3D12_BARRIER_ACCESS {
+  if layout == {
+    case .UNDEFINED; return access;
+    case .PRESENT; return .NO_ACCESS;
+    case .RENDER_TARGET; return access & .RENDER_TARGET;
+    case .UNORDERED_ACCESS; return access & .UNORDERED_ACCESS;
+    case .DEPTH_STENCIL_WRITE; return access & (.DEPTH_STENCIL_READ | .DEPTH_STENCIL_WRITE);
+    case .DEPTH_STENCIL_READ; return access & .DEPTH_STENCIL_READ;
+    case .SHADER_RESOURCE; return access & .SHADER_RESOURCE;
+    case .COPY_SOURCE; return access & .COPY_SOURCE;
+    case .COPY_DEST; return access & .COPY_DEST;
+  }
+
+  return access;
+}
+
+keep_compatible_sync :: inline(sync: D3D12_BARRIER_SYNC, access: D3D12_BARRIER_ACCESS) -> D3D12_BARRIER_SYNC {
+  compatible: D3D12_BARRIER_SYNC;
+
+  if access & .VERTEX_BUFFER {
+    compatible |= (.ALL | .VERTEX_SHADING | .DRAW | .ALL_SHADING);
+  }
+
+  if access & .CONSTANT_BUFFER {
+    compatible |= (.ALL | .VERTEX_SHADING | .PIXEL_SHADING | .COMPUTE_SHADING | .DRAW | .ALL_SHADING);
+  }
+
+  if access & .INDEX_BUFFER {
+    compatible |= (.ALL | .INDEX_INPUT | .DRAW);
+  }
+
+  if access & .RENDER_TARGET {
+    compatible |= (.ALL | .DRAW | .RENDER_TARGET);
+  }
+
+  if access & .UNORDERED_ACCESS {
+    compatible |= (.ALL | .VERTEX_SHADING | .PIXEL_SHADING | .COMPUTE_SHADING | .DRAW | .ALL_SHADING | .EMIT_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO | .RAYTRACING);
+  }
+
+  if access & (.DEPTH_STENCIL_WRITE | .DEPTH_STENCIL_READ) {
+    compatible |= (.ALL | .DRAW | .DEPTH_STENCIL);
+  }
+
+  if access & .SHADER_RESOURCE {
+    compatible |= (.ALL | .VERTEX_SHADING | .PIXEL_SHADING | .COMPUTE_SHADING | .DRAW | .ALL_SHADING | .BUILD_RAYTRACING_ACCELERATION_STRUCTURE | .RAYTRACING);
+  }
+
+  if access & .INDIRECT_ARGUMENT {
+    compatible |= (.ALL | .EXECUTE_INDIRECT);
+  }
+
+  if access & (.COPY_DEST | .COPY_SOURCE) {
+    compatible |= (.ALL | .COPY);
+  }
+
+  return sync & compatible;
+}
+
+keep_compatible_bits :: inline (layout: D3D12_BARRIER_LAYOUT, sync: D3D12_BARRIER_SYNC, access: D3D12_BARRIER_ACCESS) -> D3D12_BARRIER_SYNC, D3D12_BARRIER_ACCESS {
+  compatible_access := keep_compatible_access(layout, access);
+  compatible_sync := keep_compatible_sync(sync, compatible_access);
+
+  return compatible_sync, compatible_access;
 }
 
 barrier :: (cmd: *Cmd, before: SyncStage, after: SyncStage, layout_transitions: []LayoutTransition) {
@@ -612,13 +866,11 @@ barrier :: (cmd: *Cmd, before: SyncStage, after: SyncStage, layout_transitions: 
       t := *layout_transitions[it];
       b := *barriers[it];
 
-      b.SyncBefore = global_barrier.SyncBefore;
-      b.SyncAfter = global_barrier.SyncAfter;
-      b.AccessBefore = global_barrier.AccessBefore;
-      b.AccessAfter = global_barrier.AccessAfter;
       b.LayoutBefore = layout_to_d3d12_layout(t.before);
       b.LayoutAfter = layout_to_d3d12_layout(t.after);
-      b.pResource = get_object(cmd.device.textures, t.texture).rsc;
+      b.SyncBefore, b.AccessBefore = keep_compatible_bits(b.LayoutBefore, global_barrier.SyncBefore, global_barrier.AccessBefore);
+      b.SyncAfter, b.AccessAfter = keep_compatible_bits(b.LayoutAfter, global_barrier.SyncAfter, global_barrier.AccessAfter);
+      b.pResource = get_object(cmd.device.textures, t.texture).handle;
       b.Subresources.IndexOrFirstMipLevel = 0xFFFFFFFF;
     }
   }
@@ -630,7 +882,7 @@ clear_rtv :: (cmd: *Cmd, rtv: Texture, clear_color: ClearColor) {
   d3d12_rtv := get_object(cmd.device.textures, rtv);
 
   handle := ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(cmd.rtv_heap);
-  ID3D12Device_CreateRenderTargetView(cmd.device.device, d3d12_rtv.rsc, null, handle);
+  ID3D12Device_CreateRenderTargetView(cmd.device.device, d3d12_rtv.handle, null, handle);
   d3d12_clear_color := float.[clear_color.r, clear_color.g, clear_color.b, clear_color.a];
 
   ID3D12GraphicsCommandList_ClearRenderTargetView(cmd.cmd, handle, *d3d12_clear_color, 0, null);
@@ -646,7 +898,7 @@ set_render_targets :: (cmd: *Cmd, color_targets: []Texture, depth_target: Textur
     for color_targets {
       handle := D3D12_CPU_DESCRIPTOR_HANDLE.{ ptr = rtv_head.ptr + cast(u64) it_index * cmd.device.rtv_descriptor_size };
       d3d12_color_target := get_object(cmd.device.textures, it);
-      ID3D12Device_CreateRenderTargetView(cmd.device.device, d3d12_color_target.rsc, null, handle);
+      ID3D12Device_CreateRenderTargetView(cmd.device.device, d3d12_color_target.handle, null, handle);
     }
   }
 
@@ -655,7 +907,7 @@ set_render_targets :: (cmd: *Cmd, color_targets: []Texture, depth_target: Textur
   if depth_target != xx null_handle {
     handle := ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(cmd.dsv_heap);
     d3d12_depth_target := get_object(cmd.device.textures, depth_target);
-    ID3D12Device_CreateDepthStencilView(cmd.device.device, d3d12_depth_target.rsc, null, handle);
+    ID3D12Device_CreateDepthStencilView(cmd.device.device, d3d12_depth_target.handle, null, handle);
     dsv_handle_ptr = *handle;
   }
 
@@ -678,6 +930,72 @@ draw :: (cmd: *Cmd, vertex_count: u32, instance_count: u32, first_vertex: u32, f
 
 draw_indexed :: (cmd: *Cmd, index_count: u32, instance_count: u32, first_index: u32, vertex_offset: s32, first_instance: u32) {
   ID3D12GraphicsCommandList_DrawIndexedInstanced(cmd.cmd, index_count, instance_count, first_index, vertex_offset, first_instance);
+}
+
+copy :: (cmd: *Cmd, copy: BufferCopy) {
+  d3d12_dst := get_object(cmd.device.buffers, copy.dst).handle;
+  d3d12_src := get_object(cmd.device.buffers, copy.src).handle;
+
+  ID3D12GraphicsCommandList_CopyBufferRegion(cmd.cmd, d3d12_dst, copy.dst_offset, d3d12_src, copy.src_offset, copy.size);
+}
+
+copy :: (cmd: *Cmd, copy: TextureCopy) {
+  d3d12_dst := get_object(cmd.device.textures, copy.dst).handle;
+  d3d12_src := get_object(cmd.device.textures, copy.src).handle;
+  dst_location := D3D12_TEXTURE_COPY_LOCATION.{
+    pResource = d3d12_dst,
+    Type = .SUBRESOURCE_INDEX,
+    SubresourceIndex = subresource_index(copy.dst_subresource, 1),
+  };
+  src_location := D3D12_TEXTURE_COPY_LOCATION.{
+    pResource = d3d12_src,
+    Type = .SUBRESOURCE_INDEX,
+    SubresourceIndex = subresource_index(copy.src_subresource, 1),
+  };
+  src_box := D3D12_BOX.{
+    left = copy.src_x,
+    top = copy.src_y,
+    front = 0,
+    right = copy.src_x + copy.width,
+    bottom = copy.src_y + copy.height,
+    back = 1,
+  };
+
+  ID3D12GraphicsCommandList_CopyTextureRegion(
+    cmd.cmd, *dst_location, copy.dst_x, copy.dst_y, 0, *src_location, *src_box);
+}
+
+copy :: (cmd: *Cmd, copy: BufferToTextureCopy) {
+  d3d12_dst := get_object(cmd.device.textures, copy.texture);
+  d3d12_src := get_object(cmd.device.buffers, copy.buffer);
+  dst_location := D3D12_TEXTURE_COPY_LOCATION.{
+    pResource = d3d12_dst.handle,
+    Type = .SUBRESOURCE_INDEX,
+    SubresourceIndex = subresource_index(copy.texture_subresource, 1),
+  };
+
+  src_footprint := D3D12_PLACED_SUBRESOURCE_FOOTPRINT.{
+    Offset = copy.buffer_offset,
+    Footprint = .{
+      Format = format_to_dxgi(d3d12_dst.format),
+      Width = copy.width,
+      Height = copy.height,
+      Depth = 1,
+      RowPitch = align_pot(d3d12_dst.width * get_format_desc(d3d12_dst.format).bytes_per_block, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT),
+    },
+  };
+  src_location := D3D12_TEXTURE_COPY_LOCATION.{
+    pResource = d3d12_src.handle,
+    Type = .PLACED_FOOTPRINT,
+    PlacedFootprint = src_footprint,
+  };
+
+  ID3D12GraphicsCommandList_CopyTextureRegion(
+    cmd.cmd, *dst_location, copy.texture_x, copy.texture_y, 0, *src_location, null);
+}
+
+copy :: (cmd: *Cmd, copy: TextureToBufferCopy) {
+  assert(false);
 }
 
 submit :: (device: *Device, cmd: *Cmd) {
@@ -805,7 +1123,7 @@ create_graphics_pipeline :: (device: *Device, using desc: GraphicsPipelineDesc) 
     so.rtv_formats.NumRenderTargets = xx render_target_formats.count;
 
     for render_target_formats {
-      so.rtv_formats.RTFormats[it_index] = it;
+      so.rtv_formats.RTFormats[it_index] = format_to_dxgi(it);
     }
 
     write_stream(so);
@@ -850,4 +1168,156 @@ destroy :: (device: *Device, pipeline: Pipeline) {
   assert(removed);
 
   release(d3d12_pipeline.handle);
+}
+
+create_memory_heap :: (device: *Device, memory_heap_desc: MemoryHeapDesc) -> MemoryHeap, bool {
+  handle: *ID3D12Heap;
+
+  d3d12_desc := D3D12_HEAP_DESC.{
+    SizeInBytes = memory_heap_desc.size,
+    Properties = .{ Type = memory_heap_desc.heap_type, },
+    // MSAA needs higher alignment value.
+    Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
+    Flags = .ALLOW_ALL_BUFFERS_AND_TEXTURES,
+  };
+
+  result := ID3D12Device_CreateHeap(device.device, *d3d12_desc, *uid(ID3D12Heap_UUID), xx *handle);
+  rif_handle(result, "Unable to create memory heap");
+
+  return add_object(*device.memory_heaps, .{ handle = handle }), true;
+}
+
+destroy :: (device: *Device, memory_heap: MemoryHeap) {
+  d3d12_memory_heap, removed := remove_object(*device.memory_heaps, memory_heap);
+  assert(removed);
+
+  release(d3d12_memory_heap.handle);
+}
+
+get_texture_allocation_requirements :: (device: *Device, texture_desc: TextureDesc) -> AllocationRequirements {
+  resource_desc := D3D12_RESOURCE_DESC1.{
+    Dimension = .TEXTURE2D,
+    Width = texture_desc.width,
+    Height = texture_desc.height,
+    DepthOrArraySize = 1,
+    MipLevels = 1,
+    Format = format_to_dxgi(texture_desc.format),
+    SampleDesc = .{ Count = 1, Quality = 0 },
+    Layout = .UNKNOWN,
+    Flags = .NONE,
+  };
+
+  allocation_info: D3D12_RESOURCE_ALLOCATION_INFO1;
+  ID3D12Device8_GetResourceAllocationInfo2(device.device, 0, 1, *resource_desc, *allocation_info);
+
+  return .{ alignment = allocation_info.Alignment, size = allocation_info.SizeInBytes };
+}
+
+get_buffer_allocation_requirements :: (device: *Device, buffer_desc: BufferDesc) -> AllocationRequirements {
+  resource_desc := D3D12_RESOURCE_DESC1.{
+    Dimension = .BUFFER,
+    Width = buffer_desc.size,
+    Height = 1,
+    Format = .UNKNOWN,
+    Layout = .ROW_MAJOR,
+    Flags = buffer_desc.usage,
+  };
+
+  allocation_info: D3D12_RESOURCE_ALLOCATION_INFO1;
+  ID3D12Device8_GetResourceAllocationInfo2(device.device, 0, 1, *resource_desc, *allocation_info);
+
+  return .{ alignment = allocation_info.Alignment, size = allocation_info.SizeInBytes };
+}
+
+create_texture :: (device: *Device, memory: Memory, texture_desc: TextureDesc) -> Texture, bool {
+  resource_desc := D3D12_RESOURCE_DESC1.{
+    Dimension = .TEXTURE2D,
+    Width = texture_desc.width,
+    Height = texture_desc.height,
+    DepthOrArraySize = 1,
+    MipLevels = 1,
+    Format = format_to_dxgi(texture_desc.format),
+    SampleDesc = .{ Count = 1, Quality = 0 },
+    Layout = .UNKNOWN,
+    Flags = texture_desc.usage,
+  };
+  clear_value := D3D12_CLEAR_VALUE.{
+    Format = format_to_dxgi(texture_desc.format),
+  };
+  d3d12_heap := get_object(device.memory_heaps, memory.heap).handle;
+
+  resource: *ID3D12Resource;
+  result := ID3D12Device10_CreatePlacedResource2(
+    device.device,
+    d3d12_heap,
+    memory.offset,
+    *resource_desc,
+    .UNDEFINED,
+    *clear_value,
+    0,
+    null,
+    *uid(ID3D12Resource_UUID),
+    xx *resource
+  );
+  rif_handle(result, "Unable to create texture.");
+
+  return add_object(*device.textures, .{
+    format = texture_desc.format,
+    mip_count = 1,
+    array_count = 1,
+    width = texture_desc.width,
+    height = texture_desc.height,
+    memory = memory,
+    handle = resource,
+  }), true;
+}
+
+destroy :: (device: *Device, texture: Texture) {
+  d3d12_texture, removed := remove_object(*device.textures, texture);
+  assert(removed);
+
+  release(d3d12_texture.handle);
+}
+
+create_buffer :: (device: *Device, memory: Memory, buffer_desc: BufferDesc) -> Buffer, bool {
+  resource_desc := D3D12_RESOURCE_DESC1.{
+    Dimension = .BUFFER,
+    Width = buffer_desc.size,
+    Height = 1,
+    DepthOrArraySize = 1,
+    MipLevels = 1,
+    Format = .UNKNOWN,
+    Layout = .UNKNOWN,
+    Flags = buffer_desc.usage,
+  };
+  clear_value := D3D12_CLEAR_VALUE.{};
+  d3d12_heap := get_object(device.memory_heaps, memory.heap).handle;
+
+  resource: *ID3D12Resource;
+  result := ID3D12Device10_CreatePlacedResource2(
+    device.device,
+    d3d12_heap,
+    memory.offset,
+    *resource_desc,
+    .UNDEFINED,
+    *clear_value,
+    0,
+    null,
+    *uid(ID3D12Resource_UUID),
+    xx *resource
+  );
+  rif_handle(result, "Unable to create buffer.");
+
+  return add_object(*device.buffers, .{ memory = memory, handle = resource, }), true;
+}
+
+destroy :: (device: *Device, buffer: Buffer) {
+  d3d12_buffer, removed := remove_object(*device.buffers, buffer);
+  assert(removed);
+
+  release(d3d12_buffer.handle);
+}
+
+subresource_index :: inline (using subresource: TextureSubresource, mip_count: u16) -> u32 {
+  return mip_index + (array_index * mip_count);
 }
