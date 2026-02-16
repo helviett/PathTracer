@@ -52,6 +52,12 @@ get_object :: (using pool: ObjectPool($T, $HT), handle: HT) -> T {
   return object;
 }
 
+set_object :: (using pool: ObjectPool($T, $HT), handle: HT, object: T) {
+  index := cast(u64) handle;
+  assert(index < cast(u64) objects.count);
+  objects[index] = object;
+}
+
 reset :: (using pool: *ObjectPool($T, $HT)) {
   array_reset(*objects);
   array_reset(*free_list);

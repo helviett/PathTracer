@@ -16,7 +16,7 @@ Device :: struct {
   shaders: ObjectPool(ShaderD3D12, Shader);
   root_sigantures: ObjectPool(RootSignatureD3D12, RootSignature);
   memory_heaps: ObjectPool(MemoryHeapD3D12, MemoryHeap);
-  descriptor_heaps: ObjectPool(MemoryHeapD3D12, MemoryHeap);
+  descriptor_heaps: ObjectPool(DescriptorHeapD3D12, DescriptorHeap);
 }
 
 Swapchain :: struct {
@@ -57,6 +57,7 @@ TextureD3D12 :: struct {
 
 BufferD3D12 :: struct {
   memory: Memory;
+  mapped_ptr: *void;
   handle: *ID3D12Resource;
 }
 
@@ -74,6 +75,10 @@ PipelineD3D12 :: struct {
 
 MemoryHeapD3D12 :: struct {
   handle: *ID3D12Heap;
+}
+
+DescriptorHeapD3D12 :: struct {
+  handle: *ID3D12DescriptorHeap;
 }
 
 rif :: (res: HRESULT, msg: string) #expand {
@@ -628,6 +633,48 @@ copy :: (cmd: *Cmd, copy: TextureToBufferCopy) {
   assert(false);
 }
 
+set_descriptor_heaps :: (cmd: *Cmd, heaps: []DescriptorHeap) {
+  auto_release_temp();
+  d3d12_heaps := NewArray(heaps.count, *ID3D12DescriptorHeap,, allocator=temp);
+
+  for heaps {
+    d3d12_heaps[it_index] = get_object(cmd.device.descriptor_heaps, it).handle;
+  }
+
+  ID3D12GraphicsCommandList_SetDescriptorHeaps(cmd.cmd, xx heaps.count, d3d12_heaps.data);
+}
+
+set_root_constants :: (cmd: *Cmd, root_index: u32, constants: *void, size: u64) {
+  assert(size % size_of(u32) == 0);
+  ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(cmd.cmd, root_index, xx (size / size_of(u32)), constants, 0);
+  ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(cmd.cmd, root_index, xx (size / size_of(u32)), constants, 0);
+}
+
+set_root_constants :: (cmd: *Cmd, root_index: u32, constants: $T) #expand {
+  set_root_constants(cmd, root_index, *constants, size_of(T));
+}
+
+set_root_cbv :: (cmd: *Cmd, root_index: u32, buffer: Buffer, offset: u64 = 0) {
+  addr := ID3D12Resource_GetGPUVirtualAddress(get_object(cmd.device.buffers, buffer).handle);
+  addr += offset;
+  ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(cmd.cmd, root_index, addr);
+  ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(cmd.cmd, root_index, addr);
+}
+
+set_root_srv :: (cmd: *Cmd, root_index: u32, buffer: Buffer, offset: u64 = 0) {
+  addr := ID3D12Resource_GetGPUVirtualAddress(get_object(cmd.device.buffers, buffer).handle);
+  addr += offset;
+  ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(cmd.cmd, root_index, addr);
+  ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(cmd.cmd, root_index, addr);
+}
+
+set_root_uav :: (cmd: *Cmd, root_index: u32, buffer: Buffer, offset: u64 = 0) {
+  addr := ID3D12Resource_GetGPUVirtualAddress(get_object(cmd.device.buffers, buffer).handle);
+  addr += offset;
+  ID3D12GraphicsCommandList_SetGraphicsRootUnorderedAccessView(cmd.cmd, root_index, addr);
+  ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(cmd.cmd, root_index, addr);
+}
+
 submit :: (device: *Device, cmd: *Cmd) {
   ID3D12CommandQueue_ExecuteCommandLists(device.queue, 1, xx *cmd.cmd);
 }
@@ -848,7 +895,10 @@ get_buffer_allocation_requirements :: (device: *Device, buffer_desc: BufferDesc)
     Dimension = .BUFFER,
     Width = buffer_desc.size,
     Height = 1,
+    DepthOrArraySize = 1,
+    MipLevels = 1,
     Format = .UNKNOWN,
+    SampleDesc = .{ Count = 1, Quality = 0 },
     Layout = .ROW_MAJOR,
     Flags = buffer_desc.usage,
   };
@@ -916,11 +966,11 @@ create_buffer :: (device: *Device, memory: Memory, buffer_desc: BufferDesc) -> B
     Height = 1,
     DepthOrArraySize = 1,
     MipLevels = 1,
+    SampleDesc = .{ Count = 1, Quality = 0 },
     Format = .UNKNOWN,
-    Layout = .UNKNOWN,
+    Layout = .ROW_MAJOR,
     Flags = buffer_desc.usage,
   };
-  clear_value := D3D12_CLEAR_VALUE.{};
   d3d12_heap := get_object(device.memory_heaps, memory.heap).handle;
 
   resource: *ID3D12Resource;
@@ -930,7 +980,7 @@ create_buffer :: (device: *Device, memory: Memory, buffer_desc: BufferDesc) -> B
     memory.offset,
     *resource_desc,
     .UNDEFINED,
-    *clear_value,
+    null,
     0,
     null,
     *uid(ID3D12Resource_UUID),
@@ -941,11 +991,60 @@ create_buffer :: (device: *Device, memory: Memory, buffer_desc: BufferDesc) -> B
   return add_object(*device.buffers, .{ memory = memory, handle = resource, }), true;
 }
 
+map :: (device: *Device, buffer: Buffer) -> *void {
+  d3d12_buffer := get_object(device.buffers, buffer);
+  ID3D12Resource_Map(d3d12_buffer.handle, 0, null, *d3d12_buffer.mapped_ptr);
+  set_object(device.buffers, buffer, d3d12_buffer);
+
+  return d3d12_buffer.mapped_ptr;
+}
+
+unmap :: (device: *Device, buffer: Buffer) -> *void {
+  d3d12_buffer := get_object(device.buffers, buffer);
+  ID3D12Resource_Unmap(d3d12_buffer.handle, 0, null);
+  d3d12_buffer.mapped_ptr = null;
+  set_object(device.device.buffers, buffer, d3d12_buffer);
+}
+
+get_mapped_ptr :: (device: *Device, buffer: Buffer) -> *void {
+  d3d12_buffer := get_object(device.buffers, buffer);
+
+  return d3d12_buffer.mapped_ptr;
+}
+
 destroy :: (device: *Device, buffer: Buffer) {
   d3d12_buffer, removed := remove_object(*device.buffers, buffer);
   assert(removed);
 
   release(d3d12_buffer.handle);
+}
+
+create_descriptor_heap :: (device: *Device, descriptor_heap_desc: DescriptorHeapDesc) -> DescriptorHeap, bool {
+  heap_desc := D3D12_DESCRIPTOR_HEAP_DESC.{
+    Type = descriptor_heap_type_to_d3d12(descriptor_heap_desc.type),
+    NumDescriptors = descriptor_heap_desc.descriptor_count,
+    Flags = .SHADER_VISIBLE,
+    NodeMask = 0,
+  };
+  heap: *ID3D12DescriptorHeap;
+  result := ID3D12Device_CreateDescriptorHeap(device.device, *heap_desc, *uid(ID3D12DescriptorHeap_UUID), xx *heap);
+  rif_handle(result, "Unable to create descriptor heap");
+
+  return add_object(*device.descriptor_heaps, .{ handle = heap, }), false;
+}
+
+destroy :: (device: *Device, descriptor_heap: DescriptorHeap) {
+  d3d12_heap, removed := remove_object(*device.descriptor_heaps, descriptor_heap);
+  assert(removed);
+
+  release(d3d12_heap.handle);
+}
+
+descriptor_heap_type_to_d3d12 :: (descriptor_heap_type: DescriptorHeapType) -> D3D12_DESCRIPTOR_HEAP_TYPE {
+  if #complete descriptor_heap_type == {
+    case .Resource; return .CBV_SRV_UAV;
+    case .Sampler; return .SAMPLER;
+  }
 }
 
 subresource_index :: inline (using subresource: TextureSubresource, mip_count: u16) -> u32 {

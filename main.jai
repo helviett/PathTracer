@@ -7,7 +7,6 @@
 #import "object-pool";
 
 // have to place it here for now
-#import "dxgi";
 #import "d3d12"()(INCLUDE_DEBUG_BINDINGS = true);
 
 Window :: #import "Window_Creation";
@@ -50,9 +49,24 @@ main :: () {
   });
 
   heap_size: u64 = 1024 * 1024 * 1024;
-  heap := create_memory_heap(*device, .{ heap_type = .DEFAULT, size = heap_size, });
+  gpu_heap := create_memory_heap(*device, .{ heap_type = .DEFAULT, size = heap_size, });
   resource_allocator: ResourceAllocator;
-  init(*resource_allocator, *device, heap, heap_size);
+  init(*resource_allocator, *device, gpu_heap, heap_size);
+
+  upload_heap := create_memory_heap(*device, .{ heap_type = .UPLOAD, size = 1 << 17, });
+  upload_resource_allocator: ResourceAllocator;
+  init(*upload_resource_allocator, *device, upload_heap, 1 << 17);
+
+
+  descriptor_heap := create_descriptor_heap(*device, .{ type = .Resource, descriptor_count = 4096, });
+  sampler_heap := create_descriptor_heap(*device, .{ type = .Sampler, descriptor_count = 2048, });
+
+  constant_buffer := create_buffer(*upload_resource_allocator, .{
+    size = 512,
+  });
+
+  red := float.[1.0, 0.0, 0.0];
+  memcpy(map(*device, constant_buffer), red.data, size_of([3]float));
 
   color_target := create_texture(*resource_allocator, .{
     format = .r8g8b8a8_unorm_srgb,
@@ -87,6 +101,8 @@ main :: () {
       swapchain_texture := get_next_texture(*swapchain);
       begin(*cmd);
 
+      set_descriptor_heaps(*cmd, .[ descriptor_heap, sampler_heap ]);
+
       barrier(*cmd, .Present, .Raster | .Copy, .[
         .{ texture = swapchain_texture, before = .Present, after = .CopyTarget, },
         .{ texture = color_target, before = .Undefined, after = .RenderTarget, },
@@ -101,6 +117,9 @@ main :: () {
 
       set_root_signature(*cmd, triangle_root_signature);
       set_pipeline(*cmd, triangle_pipeline);
+      set_root_cbv(*cmd, 0, constant_buffer);
+      set_root_srv(*cmd, 1, constant_buffer);
+
       draw(*cmd, 3, 1, 0, 0);
 
       barrier(*cmd, .Raster, .Copy, .[.{ texture = color_target, before = .RenderTarget, after = .CopySource, }]);
@@ -173,6 +192,13 @@ ResourceAllocator :: struct {
   device: *Device;
 }
 
+DescriptorAllocator :: struct {
+  offset_allocator: LinearAllocator;
+  base_offset: u32;
+  descriptor_heap: DescriptorHeap;
+  device: *Device;
+}
+
 init :: (allocator: *ResourceAllocator, device: *Device, heap: MemoryHeap, size: u64) {
   init(*allocator.offset_allocator, size);
   allocator.device = device;
@@ -195,8 +221,13 @@ create_buffer :: (using allocator: *ResourceAllocator, buffer_desc: BufferDesc) 
   return buffer, success;
 }
 
+init :: (allocator: *DescriptorAllocator, device: *Device, heap: DescriptorHeap, descriptor_count: u32, base_offset: u32) {
+  init(*allocator.offset_allocator, descriptor_count);
+  allocator.device = device;
+  allocator.descriptor_heap = heap;
+  allocator.base_offset = base_offset;
+}
+
+
 // TODO: proper deallocation once any allocator with free implementation arrives.
-
-// RHI
-
 

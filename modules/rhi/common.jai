@@ -29,6 +29,11 @@ SyncStage :: enum {
   Present :: 1 << 4;
 }
 
+DescriptorHeapType :: enum {
+  Resource;
+  Sampler;
+}
+
 Viewport :: struct {
   x: float;
   y: float;
@@ -88,6 +93,11 @@ GraphicsPipelineDesc :: struct {
 MemoryHeapDesc :: struct {
   heap_type: D3D12_HEAP_TYPE;
   size: u64;
+}
+
+DescriptorHeapDesc :: struct {
+  type: DescriptorHeapType;
+  descriptor_count: u32;
 }
 
 AllocationRequirements :: struct {
