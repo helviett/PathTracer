@@ -1,7 +1,5 @@
 #define TriangleRootSignature ""\
-  "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | SAMPLER_HEAP_DIRECTLY_INDEXED),"\
-  "CBV(b0),"\
-  "SRV(t0)"
+  "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | SAMPLER_HEAP_DIRECTLY_INDEXED)," \
 
 struct Vertex {
   uint id: SV_VertexID;
@@ -12,12 +10,9 @@ struct PixelData {
   float3 color: Color;
 };
 
-struct RootConstants {
-  float3 color;
+struct ColorCb {
+  float4 color;
 };
-
-ConstantBuffer<RootConstants> rc: register(b0);
-ByteAddressBuffer colors: register(t0);
 
 [RootSignature(TriangleRootSignature)]
 PixelData vs(Vertex v) {
@@ -27,14 +22,22 @@ PixelData vs(Vertex v) {
     float4( 0.0,  1.0, 0.0, 1.0),
   };
 
+  ByteAddressBuffer bab = ResourceDescriptorHeap[0];
+
   PixelData pixel;
   pixel.position = positions[v.id];
-  pixel.color = colors.Load<float3>(0);
+  pixel.color = bab.Load<float3>(0);
 
   return pixel;
 }
 
 [RootSignature(TriangleRootSignature)]
 float4 ps(PixelData v) : SV_Target {
-  return float4(v.color, 1.0);
+  Texture2D<float4> texture = ResourceDescriptorHeap[1];
+  SamplerState default_sampler = SamplerDescriptorHeap[0];
+  uint w, h;
+  texture.GetDimensions(w, h);
+  float2 uv = v.position.xy / float2(w, h);
+  float4 t_color = texture.Sample(default_sampler, uv * 2);
+  return float4(t_color.rgb * v.color, 1.0);
 }

@@ -1,3 +1,4 @@
+Sampler        :: #type, isa Handle;
 Texture        :: #type, isa Handle;
 Buffer         :: #type, isa Handle;
 Pipeline       :: #type, isa Handle;
@@ -14,6 +15,7 @@ Format :: enum {
 
 TextureLayout :: enum {
   Undefined;
+  ShaderResource;
   RenderTarget;
   CopySource;
   CopyTarget;
@@ -25,13 +27,34 @@ SyncStage :: enum {
   Vertex :: 1 << 0;
   Pixel :: 1 << 1;
   Raster :: 1 << 2;
-  Copy :: 1 << 3;
-  Present :: 1 << 4;
+  Compute :: 1 << 3;
+  Copy :: 1 << 4;
+  Present :: 1 << 5;
 }
 
 DescriptorHeapType :: enum {
   Resource;
   Sampler;
+}
+
+DescriptorType :: enum {
+  Undefined :: 0;
+  Sampler;
+  ConstantBuffer;
+  ShaderResourceBuffer;
+  UnorderedAccessBuffer;
+  ShaderResourceTexture;
+  UnorderedAccessTexture;
+}
+
+Descriptor :: struct {
+  type: DescriptorType;
+  heap_offset: u32;
+  handle: Handle;
+  union {
+    buffer: BufferSubresource;
+    texture: TextureSubresourceRange;
+  }
 }
 
 Viewport :: struct {
@@ -62,6 +85,26 @@ SwapchainDesc :: struct {
   width: u32;
   height: u32;
 };
+
+SamplerDesc :: struct {
+  min_filter, mag_filter, mip_filter: Filter;
+  address_u, address_v, address_w: SamplerAddressMode;
+  max_anisotropy: u32;
+}
+
+Filter :: enum {
+  Linear;
+  Nearest;
+}
+
+SamplerAddressMode :: enum {
+  SameAsUOrRepeat;
+  Repeat;
+  MirroredRepeat;
+  Clamp;
+  Border;
+  MirroredClamp;
+}
 
 TextureDesc :: struct {
   format: Format;
@@ -147,6 +190,23 @@ TextureToBufferCopy :: #type, distinct BufferToTextureCopy;
 TextureSubresource :: struct {
   mip_index: u16;
   array_index: u16;
+}
+
+RemainingMips: u16 : 0;
+RemainingLayers: u16 : 0;
+
+TextureSubresourceRange :: struct {
+  mip_index: u16;
+  layer_index: u16;
+  mip_count: u16;
+  layer_count: u16;
+}
+
+RemainingSize: u64 : 0;
+
+BufferSubresource :: struct {
+  offset: u64;
+  size: u64;
 }
 
 FormatDesc :: struct {

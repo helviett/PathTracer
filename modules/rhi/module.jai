@@ -5,11 +5,13 @@ Device :: struct {
   queue: *ID3D12CommandQueue;
   info_queue: *ID3D12InfoQueue1;
   device: *ID3D12Device10;
+  wait_idle_fence: Fence;
   cookie: u32;
-  rtv_descriptor_size: u32;
-  dsv_descriptor_size: u32;
-  cbv_srv_uav_descriptor_size: u32;
-  sampler_descriptor_size: u32;
+  rtv_descriptor_size: u64;
+  dsv_descriptor_size: u64;
+  cbv_srv_uav_descriptor_size: u64;
+  sampler_descriptor_size: u64;
+  samplers: ObjectPool(SamplerD3D12, Sampler);
   textures: ObjectPool(TextureD3D12, Texture);
   buffers: ObjectPool(BufferD3D12, Buffer);
   pipelines: ObjectPool(PipelineD3D12, Pipeline);
@@ -45,10 +47,14 @@ LayoutTransition :: struct {
   after: TextureLayout;
 }
 
+SamplerD3D12 :: struct {
+  desc: D3D12_SAMPLER_DESC;
+}
+
 TextureD3D12 :: struct {
   format: Format;
   mip_count: u16 = 1;
-  array_count: u16 = 1;
+  layer_count: u16 = 1;
   width: u32;
   height: u32;
   memory: Memory;
@@ -58,6 +64,7 @@ TextureD3D12 :: struct {
 BufferD3D12 :: struct {
   memory: Memory;
   mapped_ptr: *void;
+  size: u64;
   handle: *ID3D12Resource;
 }
 
@@ -185,7 +192,7 @@ create_device :: () -> Device, bool {
     result = ID3D12InfoQueue1_RegisterMessageCallback(info_queue, debug_callback, .FLAG_NONE, null, *cookie);
   }
 
-  return .{
+  result_device := Device.{
     factory = factory6,
     debug = debug,
     adapter = adapter,
@@ -197,7 +204,12 @@ create_device :: () -> Device, bool {
     dsv_descriptor_size = ID3D12Device_GetDescriptorHandleIncrementSize(device, .DSV),
     cbv_srv_uav_descriptor_size = ID3D12Device_GetDescriptorHandleIncrementSize(device, .CBV_SRV_UAV),
     sampler_descriptor_size = ID3D12Device_GetDescriptorHandleIncrementSize(device, .SAMPLER),
-  }, true;
+  };
+
+  is_created: bool;
+  result_device.wait_idle_fence, is_created = create_fence(*result_device);
+
+  return result_device, is_created;
 }
 
 destroy :: (device: *Device) -> () {
@@ -379,6 +391,11 @@ sync_stage_to_d3d12_sync_and_access :: (stage: SyncStage) -> D3D12_BARRIER_SYNC,
     access |= any_l0_l1_l2_access;
   }
 
+  if stage & .Compute {
+    sync |= .COMPUTE_SHADING;
+    access |= any_l0_l1_l2_access;
+  }
+
   if stage & .Raster {
     sync |= .RENDER_TARGET;
     access |= .RENDER_TARGET;
@@ -401,6 +418,7 @@ sync_stage_to_d3d12_sync_and_access :: (stage: SyncStage) -> D3D12_BARRIER_SYNC,
 layout_to_d3d12_layout :: (layout: TextureLayout) -> D3D12_BARRIER_LAYOUT {
   if #complete layout == {
     case .Undefined; return .UNDEFINED;
+    case .ShaderResource; return .SHADER_RESOURCE;
     case .RenderTarget; return .RENDER_TARGET;
     case .CopySource; return .COPY_SOURCE;
     case .CopyTarget; return .COPY_DEST;
@@ -679,6 +697,12 @@ submit :: (device: *Device, cmd: *Cmd) {
   ID3D12CommandQueue_ExecuteCommandLists(device.queue, 1, xx *cmd.cmd);
 }
 
+wait_for_completion :: (device: *Device) {
+  value := next_value(*device.wait_idle_fence);
+  signal(device, *device.wait_idle_fence, value);
+  wait_for_fence(device, *device.wait_idle_fence, value);
+}
+
 wait_for_fence :: (device: *Device, fence: *Fence, value: u64) {
   last_completed_value: u64 = ID3D12Fence_GetCompletedValue(fence.fence);
 
@@ -924,6 +948,7 @@ create_texture :: (device: *Device, memory: Memory, texture_desc: TextureDesc) -
   clear_value := D3D12_CLEAR_VALUE.{
     Format = format_to_dxgi(texture_desc.format),
   };
+  need_clear_value := texture_desc.usage & (.ALLOW_RENDER_TARGET | .ALLOW_DEPTH_STENCIL);
   d3d12_heap := get_object(device.memory_heaps, memory.heap).handle;
 
   resource: *ID3D12Resource;
@@ -933,7 +958,7 @@ create_texture :: (device: *Device, memory: Memory, texture_desc: TextureDesc) -
     memory.offset,
     *resource_desc,
     .UNDEFINED,
-    *clear_value,
+    ifx need_clear_value then *clear_value else null,
     0,
     null,
     *uid(ID3D12Resource_UUID),
@@ -944,7 +969,7 @@ create_texture :: (device: *Device, memory: Memory, texture_desc: TextureDesc) -
   return add_object(*device.textures, .{
     format = texture_desc.format,
     mip_count = 1,
-    array_count = 1,
+    layer_count = 1,
     width = texture_desc.width,
     height = texture_desc.height,
     memory = memory,
@@ -988,7 +1013,7 @@ create_buffer :: (device: *Device, memory: Memory, buffer_desc: BufferDesc) -> B
   );
   rif_handle(result, "Unable to create buffer.");
 
-  return add_object(*device.buffers, .{ memory = memory, handle = resource, }), true;
+  return add_object(*device.buffers, .{ memory = memory, size = buffer_desc.size, handle = resource, }), true;
 }
 
 map :: (device: *Device, buffer: Buffer) -> *void {
@@ -1047,8 +1072,144 @@ descriptor_heap_type_to_d3d12 :: (descriptor_heap_type: DescriptorHeapType) -> D
   }
 }
 
+swizzle_shift :: D3D12_SHADER_COMPONENT_MAPPING_SHIFT;
+swizzle_channels :: (r: u32, g: u32, b: u32, a: u32) -> u32 #expand {
+  return (r << (swizzle_shift * 0)) | (g << (swizzle_shift * 1)) | (b << (swizzle_shift * 2)) | (a << (swizzle_shift * 3)) | D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES;
+}
+
+ConstantBufferAlignment :: D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
+
+update_descriptors :: (device: *Device, heap: DescriptorHeap, descriptors: []Descriptor) {
+  d3d12_heap := get_object(device.descriptor_heaps, heap);
+  heap_start := ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(d3d12_heap.handle);
+
+  for d: descriptors {
+    using d;
+    descriptor_handle := D3D12_CPU_DESCRIPTOR_HANDLE.{ ptr = heap_start.ptr + device.cbv_srv_uav_descriptor_size * heap_offset };
+
+    if #complete type == {
+      case .Undefined; assert(false);
+      case .ConstantBuffer; #through;
+      case .ShaderResourceBuffer; #through;
+      case .UnorderedAccessBuffer;
+        d3d12_buffer := get_object(device.buffers, xx handle);
+        addr := ID3D12Resource_GetGPUVirtualAddress(d3d12_buffer.handle) + buffer.offset;
+        size := ifx buffer.size == RemainingSize then d3d12_buffer.size - buffer.offset else buffer.size;
+
+        if type == {
+          case .ConstantBuffer;
+            size = align_pot(size, ConstantBufferAlignment);
+            view := D3D12_CONSTANT_BUFFER_VIEW_DESC.{ BufferLocation = addr, SizeInBytes = xx size, };
+            ID3D12Device_CreateConstantBufferView(device.device, *view, descriptor_handle);
+          case .ShaderResourceBuffer;
+            view := D3D12_SHADER_RESOURCE_VIEW_DESC.{
+              Format = .R32_TYPELESS,
+              ViewDimension = .BUFFER,
+              Shader4ComponentMapping = swizzle_channels(0, 1, 2, 3),
+              Buffer = .{ NumElements = xx (size / size_of(u32)), Flags = .RAW, },
+            };
+            ID3D12Device_CreateShaderResourceView(device.device, d3d12_buffer.handle, *view, descriptor_handle);
+          case .UnorderedAccessBuffer;
+            view := D3D12_UNORDERED_ACCESS_VIEW_DESC.{
+              Format = .R32_TYPELESS,
+              ViewDimension = .BUFFER,
+              Buffer = .{ NumElements = xx (size / size_of(u32)), Flags = .RAW, },
+            };
+            ID3D12Device_CreateUnorderedAccessView(device.device, d3d12_buffer.handle, null, *view, descriptor_handle);
+        }
+      case .ShaderResourceTexture; #through;
+      case .UnorderedAccessTexture;
+        d3d12_texture := get_object(device.textures, xx handle);
+
+        if type == {
+          case .ShaderResourceTexture;
+            view := D3D12_SHADER_RESOURCE_VIEW_DESC.{
+              Format = format_to_dxgi(d3d12_texture.format),
+              ViewDimension = .TEXTURE2D,
+              Shader4ComponentMapping = swizzle_channels(0, 1, 2, 3),
+              Texture2D = .{
+                MostDetailedMip = texture.mip_index,
+                MipLevels = ifx texture.mip_count == RemainingMips then cast(u32) 0xFFFFFFFF else texture.mip_count,
+              },
+            };
+            ID3D12Device_CreateShaderResourceView(device.device, d3d12_texture.handle, *view, descriptor_handle);
+          case .UnorderedAccessTexture;
+            view := D3D12_UNORDERED_ACCESS_VIEW_DESC.{
+              Format = format_to_dxgi(d3d12_texture.format),
+              ViewDimension = .TEXTURE2D,
+              Texture2D = .{ MipSlice = texture.mip_index, },
+            };
+            ID3D12Device_CreateUnorderedAccessView(device.device, d3d12_texture.handle, null, *view, descriptor_handle);
+        }
+      case .Sampler;
+        descriptor_handle = D3D12_CPU_DESCRIPTOR_HANDLE.{ ptr = heap_start.ptr + device.sampler_descriptor_size * heap_offset };
+        d3d12_sampler := get_object(device.samplers, xx handle);
+        ID3D12Device_CreateSampler(device.device, *d3d12_sampler.desc, descriptor_handle);
+    }
+  }
+}
+
 subresource_index :: inline (using subresource: TextureSubresource, mip_count: u16) -> u32 {
   return mip_index + (array_index * mip_count);
+}
+
+sampler_addressing_to_d3d12 :: inline (address: SamplerAddressMode, address_u: D3D12_TEXTURE_ADDRESS_MODE) -> D3D12_TEXTURE_ADDRESS_MODE {
+  if #complete address == {
+    case .SameAsUOrRepeat; return address_u;
+    case .Repeat; return .WRAP;
+    case .MirroredRepeat; return .MIRROR;
+    case .Clamp; return .CLAMP;
+    case .Border; return .BORDER;
+    case .MirroredClamp; return .MIRROR_ONCE;
+  }
+}
+
+create_sampler :: (device: *Device, desc: SamplerDesc) -> Sampler, bool {
+  u := sampler_addressing_to_d3d12(desc.address_u, .WRAP);
+  d3d12_desc := D3D12_SAMPLER_DESC.{
+    Filter = filters_to_d3d12(desc.min_filter, desc.mag_filter, desc.mip_filter, desc.max_anisotropy),
+    AddressU = u,
+    AddressV = sampler_addressing_to_d3d12(desc.address_v, u),
+    AddressW = sampler_addressing_to_d3d12(desc.address_w, u),
+    MaxAnisotropy = desc.max_anisotropy,
+  };
+  return add_object(*device.samplers, .{ desc = d3d12_desc }), true;
+}
+
+filters_to_d3d12 :: inline (min: Filter, mag: Filter, mip: Filter, max_anisotropy: u32) -> D3D12_FILTER {
+  if max_anisotropy > 1 {
+    assert(min == .Linear && mag == .Linear);
+    return ifx mip == .Linear then .ANISOTROPIC else .MIN_MAG_ANISOTROPIC_MIP_POINT;
+  }
+
+  if #complete min == {
+    case .Linear;
+      if #complete mag == {
+        case .Linear;
+          if #complete mip == {
+            case .Linear; return .MIN_MAG_MIP_LINEAR;
+            case .Nearest; return .MIN_MAG_LINEAR_MIP_POINT;
+          }
+        case .Nearest;
+          if #complete mip == {
+            case .Linear; return .MIN_LINEAR_MAG_POINT_MIP_LINEAR;
+            case .Nearest; return .MIN_LINEAR_MAG_MIP_POINT;
+          }
+      }
+    case .Nearest;
+      if #complete mag == {
+        case .Linear;
+          if #complete mip == {
+            case .Linear; return .MIN_POINT_MAG_MIP_LINEAR;
+            case .Nearest; return .MIN_POINT_MAG_LINEAR_MIP_POINT;
+          }
+        case .Nearest;
+          if #complete mip == {
+            case .Linear; return .MIN_MAG_POINT_MIP_LINEAR;
+            case .Nearest; return .MIN_MAG_MIP_POINT;
+          }
+      }
+  }
 }
 
 // TODO: replace d3d12 enum and flags with own.
