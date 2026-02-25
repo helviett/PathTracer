@@ -6,6 +6,7 @@
 #import "allocators";
 #import "object-pool";
 #import "stb_image";
+#import "cgltf";
 
 // have to place it here for now
 #import "d3d12"()(INCLUDE_DEBUG_BINDINGS = true);
@@ -37,6 +38,13 @@ main :: () {
 
   if !result {
     return;
+  }
+
+  {
+    data: *cgltf_data;
+    options: cgltf_options;
+    r := cgltf_parse_file(*options, "sponza-gltf/sponza-png.glb", *data);
+    assert(!r);
   }
 
   compute_shader := load_shader_binary(*device, "compute.dxil");
