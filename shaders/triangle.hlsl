@@ -5,9 +5,9 @@ struct Vertex {
   uint id: SV_VertexID;
 };
 
-struct PixelData {
+struct Interpolator {
   float4 position: SV_Position;
-  float3 color: Color;
+  float2 uv: Texcoord;
 };
 
 struct ColorCb {
@@ -15,29 +15,23 @@ struct ColorCb {
 };
 
 [RootSignature(TriangleRootSignature)]
-PixelData vs(Vertex v) {
-  float4 positions[3] = {
-    float4(-1.0, -1.0, 0.0, 1.0),
-    float4( 1.0, -1.0, 0.0, 1.0),
-    float4( 0.0,  1.0, 0.0, 1.0),
-  };
+Interpolator vs(Vertex v) {
 
-  ByteAddressBuffer bab = ResourceDescriptorHeap[0];
+  Interpolator i;
+  i.position = float4(-1.0, -1.0, 0.0, 1.0);
+  i.position.x = v.id == 1 ? 3.0 : i.position.x;
+  i.position.y = v.id == 2 ? 3.0 : i.position.y;
+  i.uv = float2(0.0, 1.0);
+  i.uv.x = v.id == 1 ? 2.0 : i.uv.x;
+  i.uv.y = v.id == 2 ? -1.0 : i.uv.y;
 
-  PixelData pixel;
-  pixel.position = positions[v.id];
-  pixel.color = bab.Load<float3>(0);
-
-  return pixel;
+  return i;
 }
 
 [RootSignature(TriangleRootSignature)]
-float4 ps(PixelData v) : SV_Target {
-  Texture2D<float4> texture = ResourceDescriptorHeap[1];
+float4 ps(Interpolator i) : SV_Target {
+  Texture2D<float4> texture = ResourceDescriptorHeap[33];
   SamplerState default_sampler = SamplerDescriptorHeap[0];
-  uint w, h;
-  texture.GetDimensions(w, h);
-  float2 uv = v.position.xy / float2(w, h);
-  float4 t_color = texture.Sample(default_sampler, uv * 2);
-  return float4(t_color.rgb * v.color, 1.0);
+  float4 t_color = texture.Sample(default_sampler, i.uv);
+  return float4(t_color.rgb * float3(1.0, 1.0, 1.0), 1.0);
 }

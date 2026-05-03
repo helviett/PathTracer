@@ -48,6 +48,20 @@ compile_shaders :: () {
       stage = .Pixel,
       debug = true,
       pdb_dir = pdb_dir,
+    },
+    .{
+      path = #run path_join(shader_dir, "forward.hlsl"),
+      output_path = #run path_join(compiled_shader_dir, "forward_vs.dxil"),
+      stage = .Vertex,
+      debug = true,
+      pdb_dir = pdb_dir,
+    },
+    .{
+      path = #run path_join(shader_dir, "forward.hlsl"),
+      output_path = #run path_join(compiled_shader_dir, "forward_ps.dxil"),
+      stage = .Pixel,
+      debug = true,
+      pdb_dir = pdb_dir,
     }
   ];
 

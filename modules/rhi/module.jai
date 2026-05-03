@@ -397,8 +397,8 @@ sync_stage_to_d3d12_sync_and_access :: (stage: SyncStage) -> D3D12_BARRIER_SYNC,
   }
 
   if stage & .Raster {
-    sync |= .RENDER_TARGET;
-    access |= .RENDER_TARGET;
+    sync |= .RENDER_TARGET | .DEPTH_STENCIL;
+    access |= .RENDER_TARGET | .DEPTH_STENCIL_WRITE | .DEPTH_STENCIL_READ;
   }
 
   if stage & .Copy {
@@ -420,6 +420,7 @@ layout_to_d3d12_layout :: (layout: TextureLayout) -> D3D12_BARRIER_LAYOUT {
     case .Undefined; return .UNDEFINED;
     case .ShaderResource; return .SHADER_RESOURCE;
     case .RenderTarget; return .RENDER_TARGET;
+    case .DepthStencilTarget; return .DEPTH_STENCIL_WRITE;
     case .CopySource; return .COPY_SOURCE;
     case .CopyTarget; return .COPY_DEST;
     case .Present; return .PRESENT;
@@ -432,7 +433,8 @@ keep_compatible_access :: inline (layout: D3D12_BARRIER_LAYOUT, access: D3D12_BA
     case .PRESENT; return .NO_ACCESS;
     case .RENDER_TARGET; return access & .RENDER_TARGET;
     case .UNORDERED_ACCESS; return access & .UNORDERED_ACCESS;
-    case .DEPTH_STENCIL_WRITE; return access & (.DEPTH_STENCIL_READ | .DEPTH_STENCIL_WRITE);
+    // Spec says it's .DEPTH_STENCIL_READ | .DEPTH_STENCIL_WRITE but validation layers complain.
+    case .DEPTH_STENCIL_WRITE; return access & .DEPTH_STENCIL_WRITE;
     case .DEPTH_STENCIL_READ; return access & .DEPTH_STENCIL_READ;
     case .SHADER_RESOURCE; return access & .SHADER_RESOURCE;
     case .COPY_SOURCE; return access & .COPY_SOURCE;
@@ -481,6 +483,10 @@ keep_compatible_sync :: inline(sync: D3D12_BARRIER_SYNC, access: D3D12_BARRIER_A
     compatible |= (.ALL | .COPY);
   }
 
+  if access & (.DEPTH_STENCIL_WRITE | .DEPTH_STENCIL_WRITE) {
+    compatible |= (.ALL | .DRAW | .DEPTH_STENCIL);
+  }
+
   return sync & compatible;
 }
 
@@ -514,6 +520,8 @@ barrier :: (cmd: *Cmd, before: SyncStage, after: SyncStage, layout_transitions: 
 
     barriers := NewArray(layout_transitions.count, D3D12_TEXTURE_BARRIER,, allocator=temp);
     texture.pTextureBarriers = *barriers[0];
+    all_sync_before, all_sync_after: D3D12_BARRIER_SYNC; 
+    all_access_before, all_access_after: D3D12_BARRIER_ACCESS; 
 
     for 0..layout_transitions.count - 1 {
       t := *layout_transitions[it];
@@ -525,23 +533,61 @@ barrier :: (cmd: *Cmd, before: SyncStage, after: SyncStage, layout_transitions: 
       b.SyncAfter, b.AccessAfter = keep_compatible_bits(b.LayoutAfter, global_barrier.SyncAfter, global_barrier.AccessAfter);
       b.pResource = get_object(cmd.device.textures, t.texture).handle;
       b.Subresources.IndexOrFirstMipLevel = 0xFFFFFFFF;
+
+      all_sync_before |= b.SyncBefore;
+      all_sync_after |= b.SyncAfter;
+      all_access_before |= b.AccessBefore;
+      all_access_after |= b.AccessAfter;
+    }
+
+    // Remove target bits from global barrier to avoid false positives that
+    // .Raster turned into -> .RENDER_TARGET & .DEPTH_WRITE, but there was no depth layout transition.
+    all_sync_before &= .RENDER_TARGET | .DEPTH_STENCIL;
+    all_sync_after &= .RENDER_TARGET | .DEPTH_STENCIL;
+    all_access_before &= .RENDER_TARGET | .DEPTH_STENCIL_WRITE | .DEPTH_STENCIL_READ;
+    all_access_after &= .RENDER_TARGET | .DEPTH_STENCIL_WRITE | .DEPTH_STENCIL_READ;
+
+    global_barrier.SyncBefore &= ~all_sync_before;
+    global_barrier.SyncAfter &= ~all_sync_after;
+    global_barrier.AccessBefore &= ~all_access_before;
+    global_barrier.AccessAfter &= ~all_access_after;
+
+    global_barrier.SyncBefore &= ~(.RENDER_TARGET | .DEPTH_STENCIL);
+    global_barrier.SyncAfter &= ~(.RENDER_TARGET | .DEPTH_STENCIL);
+    global_barrier.AccessBefore &= ~(.RENDER_TARGET | .DEPTH_STENCIL_WRITE | .DEPTH_STENCIL_READ);
+    global_barrier.AccessAfter &= ~(.RENDER_TARGET | .DEPTH_STENCIL_WRITE | .DEPTH_STENCIL_READ);
+
+    if global_barrier.AccessBefore == .COMMON {
+      global_barrier.AccessBefore = .NO_ACCESS;
+    }
+    if global_barrier.AccessAfter == .COMMON {
+      global_barrier.AccessAfter = .NO_ACCESS;
     }
   }
 
   ID3D12GraphicsCommandList7_Barrier(cmd.cmd, group_count, *groups[0]);
 }
 
-clear_rtv :: (cmd: *Cmd, rtv: Texture, clear_color: ClearColor) {
-  d3d12_rtv := get_object(cmd.device.textures, rtv);
+clear_render_target :: (cmd: *Cmd, rt: Texture, clear_color: ClearColor) {
+  d3d12_rt := get_object(cmd.device.textures, rt);
 
   handle := ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(cmd.rtv_heap);
-  ID3D12Device_CreateRenderTargetView(cmd.device.device, d3d12_rtv.handle, null, handle);
+  ID3D12Device_CreateRenderTargetView(cmd.device.device, d3d12_rt.handle, null, handle);
   d3d12_clear_color := float.[clear_color.r, clear_color.g, clear_color.b, clear_color.a];
 
   ID3D12GraphicsCommandList_ClearRenderTargetView(cmd.cmd, handle, *d3d12_clear_color, 0, null);
 }
 
-set_render_targets :: (cmd: *Cmd, color_targets: []Texture, depth_target: Texture) {
+clear_depth_stencil_target :: (cmd: *Cmd, ds: Texture, clear_value: ClearDepthStencil) {
+  d3d12_ds := get_object(cmd.device.textures, ds);
+
+  handle := ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(cmd.dsv_heap);
+  ID3D12Device_CreateDepthStencilView(cmd.device.device, d3d12_ds.handle, null, handle);
+
+  ID3D12GraphicsCommandList_ClearDepthStencilView(cmd.cmd, handle, .DEPTH | .STENCIL, clear_value.depth, clear_value.stencil, 0, null);
+}
+
+set_targets :: (cmd: *Cmd, color_targets: []Texture, depth_target: Texture) {
   rtv_head := ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(cmd.rtv_heap);
   rtv_handle_ptr :*D3D12_CPU_DESCRIPTOR_HANDLE;
 
@@ -575,6 +621,32 @@ set_root_signature :: (cmd: *Cmd, root_siganture: RootSignature) {
 
 set_pipeline :: (cmd: *Cmd, pipeline: Pipeline) {
   ID3D12GraphicsCommandList_SetPipelineState(cmd.cmd, get_object(cmd.device.pipelines, pipeline).handle);
+}
+
+set_index_buffer :: (cmd: *Cmd, buffer: Buffer, index_type: IndexType, offset: u64) {
+  d3d12_buffer := get_object(cmd.device.buffers, buffer);
+  view := D3D12_INDEX_BUFFER_VIEW.{
+    BufferLocation = ID3D12Resource_GetGPUVirtualAddress(d3d12_buffer.handle) + offset,
+    SizeInBytes = xx d3d12_buffer.size,
+    Format = ifx index_type == .r16_uint then .R16_UINT else .R32_UINT,
+  };
+  ID3D12GraphicsCommandList_IASetIndexBuffer(cmd.cmd, *view);
+}
+
+set_vertex_buffers :: (cmd: *Cmd, first_binding: u32, bindings: []VertexBufferBinding) {
+  auto_release_temp();
+  views := NewArray(bindings.count, D3D12_VERTEX_BUFFER_VIEW, initialized = false);
+
+  for bindings {
+    d3d12_buffer := get_object(cmd.device.buffers, it.buffer);
+    views[it_index] = D3D12_VERTEX_BUFFER_VIEW.{
+      BufferLocation = ID3D12Resource_GetGPUVirtualAddress(d3d12_buffer.handle) + it.offset,
+      SizeInBytes = xx d3d12_buffer.size,
+      StrideInBytes = it.stride,
+    };
+  }
+
+  ID3D12GraphicsCommandList_IASetVertexBuffers(cmd.cmd, first_binding, xx views.count, views.data);
 }
 
 draw :: (cmd: *Cmd, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) {
@@ -767,6 +839,76 @@ create_compute_pipeline :: (device: *Device, using desc: ComputePipelineDesc) ->
   return add_object(*device.pipelines, .{ handle = pipeline }), true;
 }
 
+semantic_to_wide_string :: inline (semantic: Semantic) -> *u8 {
+  // TODO: Use #insert #run to generate and insert []u8 literal?
+  if #complete semantic == {
+    case .Position;
+      return "SV_Position";
+    case .Normal;
+      return "Normal";
+    case .Tangent;
+      return "Tangent";
+    case .Texcoord0; #through;
+    case .Texcoord1; #through;
+    case .Texcoord2; #through;
+    case .Texcoord3; #through;
+    case .Texcoord4; #through;
+    case .Texcoord5; #through;
+    case .Texcoord6; #through;
+    case .Texcoord7;
+      return "Texcoord";
+    case .Color0; #through;
+    case .Color1; #through;
+    case .Color2; #through;
+    case .Color3;
+      return "Color";
+    case .Attribute0;
+      return "Attribute";
+  }
+
+  return "Attribute";
+}
+
+semantic_to_index :: inline (semantic: Semantic) -> u32 {
+  if #complete semantic == {
+    case .Position; #through;
+    case .Normal; #through;
+    case .Tangent; #through;
+    case .Attribute0;
+      return 0;
+    case .Texcoord0; #through;
+    case .Texcoord1; #through;
+    case .Texcoord2; #through;
+    case .Texcoord3; #through;
+    case .Texcoord4; #through;
+    case .Texcoord5; #through;
+    case .Texcoord6; #through;
+    case .Texcoord7;
+      return xx (semantic - .Texcoord0);
+    case .Color0; #through;
+    case .Color1; #through;
+    case .Color2; #through;
+    case .Color3;
+      return xx (semantic - .Color0);
+  }
+
+  return xx (semantic - .Attribute0);
+}
+
+comparison_func_to_dx12 :: inline (func: ComparisonFunc) -> D3D12_COMPARISON_FUNC {
+  if #complete func == {
+    case .None; return .NONE;
+    case .Never; return .NEVER;
+    case .Less; return .LESS;
+    case .Equal; return .EQUAL;
+    case .LessEqual; return .LESS_EQUAL;
+    case .Greater; return .GREATER;
+    case .NotEqual; return .NOT_EQUAL;
+    case .GreaterEqual; return .GREATER_EQUAL;
+    case .Always; return .ALWAYS;
+  }
+}
+
 MAX_PIPELINE_STATE_STREAM_SIZE :: #run
   align_pot(size_of(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) + size_of(*ID3D12RootSignature), size_of(*void))
   // 2 Shaders at most.
@@ -830,9 +972,39 @@ create_graphics_pipeline :: (device: *Device, using desc: GraphicsPipelineDesc) 
     write_stream(so);
   }
 
+  if depth_stencil_target_format {
+    so: struct { type := D3D12_PIPELINE_STATE_SUBOBJECT_TYPE.DEPTH_STENCIL_FORMAT; format: DXGI_FORMAT; };
+    so.format = format_to_dxgi(depth_stencil_target_format);
+
+    write_stream(so);
+  }
+
   {
     so: struct { type := D3D12_PIPELINE_STATE_SUBOBJECT_TYPE.PRIMITIVE_TOPOLOGY; topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE; };
     so.topology = .TRIANGLE;
+
+    write_stream(so);
+  }
+
+  if vertex_desc
+  {
+    so: struct { type := D3D12_PIPELINE_STATE_SUBOBJECT_TYPE.INPUT_LAYOUT; input_layout: D3D12_INPUT_LAYOUT_DESC; };
+    input_elements := NewArray(vertex_desc.count, D3D12_INPUT_ELEMENT_DESC,, temp);
+
+    for vertex_desc {
+      input_elements[it_index] = .{
+        SemanticName = semantic_to_wide_string(it.semantic),
+        SemanticIndex = semantic_to_index(it.semantic),
+        Format = format_to_dxgi(it.format),
+        AlignedByteOffset = ifx it.offset == AppendAttribute then D3D12_APPEND_ALIGNED_ELEMENT else it.offset,
+        InputSlot = it.binding,
+      };
+    }
+
+    so.input_layout = .{
+      pInputElementDescs = input_elements.data,
+      NumElements = xx vertex_desc.count,
+    };
 
     write_stream(so);
   }
@@ -846,6 +1018,16 @@ create_graphics_pipeline :: (device: *Device, using desc: GraphicsPipelineDesc) 
       DepthClipEnable = .TRUE,
     };
 
+    write_stream(so);
+  }
+
+  {
+    so: struct { type := D3D12_PIPELINE_STATE_SUBOBJECT_TYPE.DEPTH_STENCIL2; depth_stencil: D3D12_DEPTH_STENCIL_DESC2; };
+    so.depth_stencil = .{
+      DepthEnable = xx depth_stencil_desc.enable,
+      DepthWriteMask = .ALL,
+      DepthFunc = comparison_func_to_dx12(depth_stencil_desc.func),
+    };
 
     write_stream(so);
   }
@@ -896,17 +1078,7 @@ destroy :: (device: *Device, memory_heap: MemoryHeap) {
 }
 
 get_texture_allocation_requirements :: (device: *Device, texture_desc: TextureDesc) -> AllocationRequirements {
-  resource_desc := D3D12_RESOURCE_DESC1.{
-    Dimension = .TEXTURE2D,
-    Width = texture_desc.width,
-    Height = texture_desc.height,
-    DepthOrArraySize = 1,
-    MipLevels = 1,
-    Format = format_to_dxgi(texture_desc.format),
-    SampleDesc = .{ Count = 1, Quality = 0 },
-    Layout = .UNKNOWN,
-    Flags = .NONE,
-  };
+  resource_desc := texture_desc_to_d3d12(texture_desc);
 
   allocation_info: D3D12_RESOURCE_ALLOCATION_INFO1;
   ID3D12Device8_GetResourceAllocationInfo2(device.device, 0, 1, *resource_desc, *allocation_info);
@@ -915,17 +1087,7 @@ get_texture_allocation_requirements :: (device: *Device, texture_desc: TextureDe
 }
 
 get_buffer_allocation_requirements :: (device: *Device, buffer_desc: BufferDesc) -> AllocationRequirements {
-  resource_desc := D3D12_RESOURCE_DESC1.{
-    Dimension = .BUFFER,
-    Width = buffer_desc.size,
-    Height = 1,
-    DepthOrArraySize = 1,
-    MipLevels = 1,
-    Format = .UNKNOWN,
-    SampleDesc = .{ Count = 1, Quality = 0 },
-    Layout = .ROW_MAJOR,
-    Flags = buffer_desc.usage,
-  };
+  resource_desc := buffer_desc_to_d3d12(buffer_desc);
 
   allocation_info: D3D12_RESOURCE_ALLOCATION_INFO1;
   ID3D12Device8_GetResourceAllocationInfo2(device.device, 0, 1, *resource_desc, *allocation_info);
@@ -933,7 +1095,8 @@ get_buffer_allocation_requirements :: (device: *Device, buffer_desc: BufferDesc)
   return .{ alignment = allocation_info.Alignment, size = allocation_info.SizeInBytes };
 }
 
-create_texture :: (device: *Device, memory: Memory, texture_desc: TextureDesc) -> Texture, bool {
+texture_desc_to_d3d12 :: inline (texture_desc: TextureDesc) -> D3D12_RESOURCE_DESC1 {
+  usage := texture_usage_to_d3d12(texture_desc.usage);
   resource_desc := D3D12_RESOURCE_DESC1.{
     Dimension = .TEXTURE2D,
     Width = texture_desc.width,
@@ -943,12 +1106,46 @@ create_texture :: (device: *Device, memory: Memory, texture_desc: TextureDesc) -
     Format = format_to_dxgi(texture_desc.format),
     SampleDesc = .{ Count = 1, Quality = 0 },
     Layout = .UNKNOWN,
-    Flags = texture_desc.usage,
+    Flags = usage,
   };
+
+  return resource_desc;
+}
+
+texture_usage_to_d3d12 :: inline (usage: TextureUsage) -> D3D12_RESOURCE_FLAGS {
+  flags: D3D12_RESOURCE_FLAGS;
+
+  if usage & .UnorderedAccess {
+    flags |= .ALLOW_UNORDERED_ACCESS;
+  }
+
+  if usage & .RenderTarget {
+    flags |= .ALLOW_RENDER_TARGET;
+  }
+
+  if usage & .DepthStencil {
+    flags |= .ALLOW_DEPTH_STENCIL;
+  }
+
+  return flags;
+}
+
+create_texture :: (device: *Device, memory: Memory, texture_desc: TextureDesc) -> Texture, bool {
+  resource_desc := texture_desc_to_d3d12(texture_desc);
   clear_value := D3D12_CLEAR_VALUE.{
     Format = format_to_dxgi(texture_desc.format),
   };
-  need_clear_value := texture_desc.usage & (.ALLOW_RENDER_TARGET | .ALLOW_DEPTH_STENCIL);
+
+  if resource_desc.Flags & .ALLOW_RENDER_TARGET {
+    clear_value.Color.data[0] = texture_desc.clear_color.r;
+    clear_value.Color.data[1] = texture_desc.clear_color.g;
+    clear_value.Color.data[2] = texture_desc.clear_color.b;
+    clear_value.Color.data[3] = texture_desc.clear_color.a;
+  } else if resource_desc.Flags & .ALLOW_DEPTH_STENCIL {
+    clear_value.DepthStencil.Depth = texture_desc.clear_depth_stencil.depth;
+    clear_value.DepthStencil.Stencil = texture_desc.clear_depth_stencil.stencil;
+  }
+  need_clear_value := resource_desc.Flags & (.ALLOW_RENDER_TARGET | .ALLOW_DEPTH_STENCIL);
   d3d12_heap := get_object(device.memory_heaps, memory.heap).handle;
 
   resource: *ID3D12Resource;
@@ -965,6 +1162,8 @@ create_texture :: (device: *Device, memory: Memory, texture_desc: TextureDesc) -
     xx *resource
   );
   rif_handle(result, "Unable to create texture.");
+
+  name_object(resource, texture_desc.name);
 
   return add_object(*device.textures, .{
     format = texture_desc.format,
@@ -984,7 +1183,7 @@ destroy :: (device: *Device, texture: Texture) {
   release(d3d12_texture.handle);
 }
 
-create_buffer :: (device: *Device, memory: Memory, buffer_desc: BufferDesc) -> Buffer, bool {
+buffer_desc_to_d3d12 :: (buffer_desc: BufferDesc) -> D3D12_RESOURCE_DESC1 {
   resource_desc := D3D12_RESOURCE_DESC1.{
     Dimension = .BUFFER,
     Width = buffer_desc.size,
@@ -994,8 +1193,29 @@ create_buffer :: (device: *Device, memory: Memory, buffer_desc: BufferDesc) -> B
     SampleDesc = .{ Count = 1, Quality = 0 },
     Format = .UNKNOWN,
     Layout = .ROW_MAJOR,
-    Flags = buffer_desc.usage,
+    Flags = buffer_usage_to_d3d12(buffer_desc.usage),
   };
+
+  return resource_desc;
+}
+
+// TODO: move all helpers under #scope_file
+buffer_usage_to_d3d12 :: inline (usage: BufferUsage) -> D3D12_RESOURCE_FLAGS {
+  flags: D3D12_RESOURCE_FLAGS;
+
+  if !(usage & .ShaderResource) {
+    flags |= .DENY_SHADER_RESOURCE;
+  }
+
+  if usage & .UnorderedAccess {
+    flags |= .ALLOW_UNORDERED_ACCESS;
+  }
+
+  return flags;
+}
+
+create_buffer :: (device: *Device, memory: Memory, buffer_desc: BufferDesc) -> Buffer, bool {
+  resource_desc := buffer_desc_to_d3d12(buffer_desc);
   d3d12_heap := get_object(device.memory_heaps, memory.heap).handle;
 
   resource: *ID3D12Resource;
@@ -1012,6 +1232,8 @@ create_buffer :: (device: *Device, memory: Memory, buffer_desc: BufferDesc) -> B
     xx *resource
   );
   rif_handle(result, "Unable to create buffer.");
+
+  name_object(resource, buffer_desc.name);
 
   return add_object(*device.buffers, .{ memory = memory, size = buffer_desc.size, handle = resource, }), true;
 }
@@ -1176,6 +1398,14 @@ create_sampler :: (device: *Device, desc: SamplerDesc) -> Sampler, bool {
   return add_object(*device.samplers, .{ desc = d3d12_desc }), true;
 }
 
+name_object :: inline (obj: *ID3D12Object, name: string) {
+  auto_release_temp();
+  if (name) {
+    wide_name := utf8_to_wide(name,, temp);
+    ID3D12Object_SetName(obj, xx wide_name);
+  }
+}
+
 filters_to_d3d12 :: inline (min: Filter, mag: Filter, mip: Filter, max_anisotropy: u32) -> D3D12_FILTER {
   if max_anisotropy > 1 {
     assert(min == .Linear && mag == .Linear);
@@ -1224,5 +1454,6 @@ filters_to_d3d12 :: inline (min: Filter, mag: Filter, mip: Filter, max_anisotrop
 #import "object-pool";
 #import "allocators";
 #import "Basic";
+#import "Windows_Utf8";
 
 #load "common.jai";

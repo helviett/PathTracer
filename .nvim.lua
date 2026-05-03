@@ -45,9 +45,18 @@ function BuildAndRun()
 end
 
 
-vim.api.nvim_set_keymap("n", "<leader>pb", ":lua Build()<CR>", { noremap = true })
-vim.api.nvim_set_keymap("n", "<leader>pr", ":lua BuildAndRun()<CR>", { noremap = true })
--- vim.api.nvim_set_keymap("n", "<leader>pbr", ":lua BuildAndRun()<CR>", { noremap = true })
+vim.keymap.set("n", "<leader>pb", function()
+  if vim.bo.modified then
+    vim.cmd.write()
+  end
+  Build()
+end)
+vim.keymap.set("n", "<leader>pr", function()
+  if vim.bo.modified then
+    vim.cmd.write()
+  end
+  BuildAndRun()
+end)
 
 local builtin = require('telescope.builtin')
 vim.keymap.set('n', '<leader>fj', function() builtin.find_files({cwd = 'D:\\projects\\jai'}) end, { desc = 'Jai Find Files' })

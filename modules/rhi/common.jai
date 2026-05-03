@@ -9,14 +9,20 @@ DescriptorHeap :: #type, isa Handle;
 
 Format :: enum {
   unknown;
+  r8g8_unorm;
   r8g8b8a8_unorm;
   r8g8b8a8_unorm_srgb;
+  r32g32_sfloat;
+  r32g32b32_sfloat;
+  r32g32b32a32_sfloat;
+  d32_sfloat;
 }
 
 TextureLayout :: enum {
   Undefined;
   ShaderResource;
   RenderTarget;
+  DepthStencilTarget;
   CopySource;
   CopyTarget;
   Present;
@@ -45,6 +51,30 @@ DescriptorType :: enum {
   UnorderedAccessBuffer;
   ShaderResourceTexture;
   UnorderedAccessTexture;
+}
+
+IndexType :: enum {
+  r16_uint;
+  r32_uint;
+}
+
+Semantic :: enum {
+  Position;
+  Normal;
+  Tangent;
+  Texcoord0;
+  Texcoord1;
+  Texcoord2;
+  Texcoord3;
+  Texcoord4;
+  Texcoord5;
+  Texcoord6;
+  Texcoord7;
+  Color0;
+  Color1;
+  Color2;
+  Color3;
+  Attribute0;
 }
 
 Descriptor :: struct {
@@ -80,6 +110,11 @@ ClearColor :: struct {
   a: float;
 }
 
+ClearDepthStencil :: struct {
+  depth: float;
+  stencil: u8;
+}
+
 SwapchainDesc :: struct {
   hwnd: HWND;
   width: u32;
@@ -106,16 +141,38 @@ SamplerAddressMode :: enum {
   MirroredClamp;
 }
 
+TextureUsage :: enum {
+  None            :: 0;
+  ShaderResource  :: 1 << 0;
+  UnorderedAccess :: 1 << 1;
+  RenderTarget    :: 1 << 2;
+  DepthStencil    :: 1 << 3;
+}
+
 TextureDesc :: struct {
   format: Format;
   width: u32;
   height: u32;
-  usage: D3D12_RESOURCE_FLAGS;
+  usage: TextureUsage;
+  union {
+    clear_color: ClearColor;
+    clear_depth_stencil: ClearDepthStencil;
+  }
+  name: string;
+}
+
+BufferUsage :: enum {
+  None            :: 0;
+  VertexBuffer    :: 1 << 0;
+  IndexBuffer     :: 1 << 1;
+  ShaderResource  :: 1 << 2;
+  UnorderedAccess :: 1 << 3;
 }
 
 BufferDesc :: struct {
   size: u64;
-  usage: D3D12_RESOURCE_FLAGS;
+  usage: BufferUsage;
+  name: string;
 }
 
 ShaderDesc :: struct {
@@ -131,6 +188,9 @@ GraphicsPipelineDesc :: struct {
   vs: Shader = xx null_handle;
   ps: Shader = xx null_handle;
   render_target_formats: []Format;
+  depth_stencil_target_format: Format;
+  depth_stencil_desc: DepthStencilDesc;
+  vertex_desc: []VertexAttributeDesc;
 }
 
 MemoryHeapDesc :: struct {
@@ -209,16 +269,58 @@ BufferSubresource :: struct {
   size: u64;
 }
 
+VertexBufferBinding :: struct {
+  buffer: Buffer;
+  offset: u64;
+  stride: u32;
+}
+
 FormatDesc :: struct {
   bytes_per_block: u32;
+}
+
+AppendAttribute: u32 : 0xFFFFFFFF;
+
+VertexAttributeDesc :: struct {
+  semantic: Semantic;
+  format: Format;
+  binding: u32;
+  offset: u32 = AppendAttribute;
+}
+
+DepthStencilDesc :: struct {
+  enable: bool; 
+  func: ComparisonFunc;
+}
+
+ComparisonFunc :: enum {
+  None          :: 0;
+  Never         :: 1;
+  Less          :: 2;
+  Equal         :: 3;
+  LessEqual     :: 4;
+  Greater       :: 5;
+  NotEqual      :: 6;
+  GreaterEqual  :: 7;
+  Always        :: 8;
 }
 
 get_format_desc :: inline (format: Format) -> FormatDesc {
   if #complete format == {
     case .unknown;
       return .{};
+    case .r8g8_unorm;
+      return .{ bytes_per_block = 2 };
     case .r8g8b8a8_unorm; #through;
     case .r8g8b8a8_unorm_srgb;
+      return .{ bytes_per_block = 4 };
+    case .r32g32_sfloat;
+      return .{ bytes_per_block = 8 };
+    case .r32g32b32_sfloat;
+      return .{ bytes_per_block = 12 };
+    case .r32g32b32a32_sfloat;
+      return .{ bytes_per_block = 16 };
+    case .d32_sfloat;
       return .{ bytes_per_block = 4 };
   }
 }
@@ -226,16 +328,25 @@ get_format_desc :: inline (format: Format) -> FormatDesc {
 format_to_dxgi :: inline (format: Format) -> DXGI_FORMAT {
   if #complete format == {
     case .unknown; return .UNKNOWN;
+    case .r8g8_unorm; return .R8G8_UNORM;
     case .r8g8b8a8_unorm; return .R8G8B8A8_UNORM;
     case .r8g8b8a8_unorm_srgb; return .R8G8B8A8_UNORM_SRGB;
+    case .r32g32_sfloat; return .R32G32_FLOAT;
+    case .r32g32b32_sfloat; return .R32G32B32_FLOAT;
+    case .r32g32b32a32_sfloat; return .R32G32B32A32_FLOAT;
+    case .d32_sfloat; return .D32_FLOAT;
   }
 }
 
 dxgi_to_format :: inline (dxgi: DXGI_FORMAT) -> Format {
   if dxgi == {
     case .UNKNOWN; return .unknown;
+    case .R8G8_UNORM; return .r8g8_unorm;
     case .R8G8B8A8_UNORM; return .r8g8b8a8_unorm;
     case .R8G8B8A8_UNORM_SRGB; return .r8g8b8a8_unorm_srgb;
+    case .R32G32_FLOAT; return .r32g32_sfloat;
+    case .R32G32B32_FLOAT; return .r32g32b32_sfloat;
+    case .R32G32B32A32_FLOAT; return .r32g32b32a32_sfloat;
   }
 
   assert(false);
