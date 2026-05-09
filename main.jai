@@ -20,6 +20,9 @@ Input  :: #import "Input";
 width :: 1920;
 height :: 1080;
 
+INVALID_TEXTURE: u32 : 0xffffffff;
+INVALID_MESH: u32 : 0xffffffff;
+
 upload_buffer: Buffer;
 upload_ptr: *void;
 upload_cmd: Cmd;
@@ -169,13 +172,39 @@ main :: () {
 
   update_descriptors(*device, sampler_heap, .[.{ type = .Sampler, heap_offset = 0, handle = sampler, },]);
 
-  scene, success := load_gltf_scene(*device, "sponza-gltf/source/Sponza.gltf");
+  albedo_stub := create_texture(*resource_allocator, .{
+    format = .r8g8b8a8_unorm_srgb,
+    width = 1,
+    height = 1,
+    usage = .ShaderResource,
+  });
+
+  normal_stub := create_texture(*resource_allocator, .{
+    format = .r8g8b8a8_unorm,
+    width = 1,
+    height = 1,
+    usage = .ShaderResource,
+  });
+
+  metallic_roughness_stub := create_texture(*resource_allocator, .{
+    format = .r8g8b8a8_unorm,
+    width = 1,
+    height = 1,
+    usage = .ShaderResource,
+  });
+
+
+
+  scene, success := load_gltf_scene(.{
+    device = *device,
+    path = "sponza-gltf/source/Sponza.gltf",
+    descriptor_heap = descriptor_heap,
+    descriptor_heap_offset = 0,
+    albedo_stub = albedo_stub,
+    normal_stub = normal_stub,
+    metallic_roughness_stub = metallic_roughness_stub,
+  });
   //scene, success := load_gltf_scene(*device, "DamagedHelmet/glTF/DamagedHelmet.gltf");
-  for scene.textures {
-    update_descriptors(*device, descriptor_heap, .[
-      .{ type = .ShaderResourceTexture, heap_offset = xx it_index, handle = it, texture = .{} }
-    ]);
-  }
 
   color_target := create_texture(*resource_allocator, .{
     format = .r8g8b8a8_unorm_srgb,
@@ -430,10 +459,11 @@ Scene :: struct {
   nodes: []Node;
 }
 
-INVALID_TEXTURE: u32 : 0xffffffff;
 
 Material :: struct {
   albedo_index: u32 = INVALID_TEXTURE;
+  normal_index: u32 = INVALID_TEXTURE;
+  metallic_roughness_index: u32 = INVALID_TEXTURE;
 }
 
 Mesh :: struct {
@@ -446,8 +476,6 @@ Submesh :: struct {
   first_vertex: s32;
   material_id: u32;
 }
-
-INVALID_MESH: u32 : 0xffffffff;
 
 Node :: struct {
   mesh_id: u32 = INVALID_MESH;
@@ -501,7 +529,15 @@ cgltf_calc_size :: (accessor: cgltf_accessor) -> u64 {
   return cgltf_calc_size(accessor.type, accessor.component_type);
 }
 
-load_gltf_scene :: (device: *Device, path: string) -> Scene, bool {
+GltfLoadDesc :: struct {
+  device: *Device;
+  path: string;
+  descriptor_heap: DescriptorHeap;
+  descriptor_heap_offset: u64;
+  albedo_stub, normal_stub, metallic_roughness_stub: Texture;
+}
+
+load_gltf_scene :: (using load_desc: GltfLoadDesc) -> Scene, bool {
   auto_release_temp();
 
   data: *cgltf_data;
@@ -545,7 +581,7 @@ load_gltf_scene :: (device: *Device, path: string) -> Scene, bool {
       return xx image_index;
     }
 
-    return 0xffffffff;
+    return INVALID_TEXTURE;
   }
 
   materials := NewArray(xx data.materials_count, Material);
@@ -556,10 +592,10 @@ load_gltf_scene :: (device: *Device, path: string) -> Scene, bool {
 
     if gltf_material.has_pbr_metallic_roughness {
       material.albedo_index = derive_meta(gltf_material.pbr_metallic_roughness.base_color_texture.texture, .r8g8b8a8_unorm_srgb);
-      derive_meta(gltf_material.pbr_metallic_roughness.metallic_roughness_texture.texture, .r8g8b8a8_unorm);
+      material.metallic_roughness_index = derive_meta(gltf_material.pbr_metallic_roughness.metallic_roughness_texture.texture, .r8g8b8a8_unorm);
     }
 
-    derive_meta(gltf_material.normal_texture.texture, .r8g8b8a8_unorm);
+    material.normal_index = derive_meta(gltf_material.normal_texture.texture, .r8g8b8a8_unorm);
     derive_meta(gltf_material.emissive_texture.texture, .r8g8b8a8_unorm);
 
     materials[it] = material;
@@ -881,9 +917,23 @@ load_gltf_scene :: (device: *Device, path: string) -> Scene, bool {
   }
 
 
-  material_stream := create_buffer(*resource_allocator, .{ size = xx (materials.count * size_of(u32)) });
+  material_stream := create_buffer(*resource_allocator, .{ size = xx (materials.count * size_of(u32)), name = "material_stream" });
   {
-    memcpy(upload_ptr, materials.data, materials.count * size_of(u32));
+    dst: *u32 = upload_ptr;
+    descriptor_offset := descriptor_heap_offset;
+    for materials {
+      albedo_texture := ifx it.albedo_index != INVALID_TEXTURE then textures[it.albedo_index] else albedo_stub;
+      normal_texture := ifx it.normal_index != INVALID_TEXTURE then textures[it.normal_index] else normal_stub;
+      metallic_roughness_texture := ifx it.metallic_roughness_index != INVALID_TEXTURE then textures[it.metallic_roughness_index] else metallic_roughness_stub;
+      update_descriptors(device, descriptor_heap, .[
+        .{ type = .ShaderResourceTexture, heap_offset = xx (descriptor_offset + 0), handle = albedo_texture, texture = .{} },
+        .{ type = .ShaderResourceTexture, heap_offset = xx (descriptor_offset + 1), handle = normal_texture, texture = .{} },
+        .{ type = .ShaderResourceTexture, heap_offset = xx (descriptor_offset + 2), handle = metallic_roughness_texture, texture = .{} }
+      ]);
+      dst.* = xx descriptor_offset;
+      dst += 1;
+      descriptor_offset += 3;
+    }
     begin(*upload_cmd);
     copy(*upload_cmd, BufferCopy.{
         dst = material_stream,
@@ -898,7 +948,7 @@ load_gltf_scene :: (device: *Device, path: string) -> Scene, bool {
     wait_for_completion(device);
   }
 
-  submesh_stream := create_buffer(*resource_allocator, .{ size = xx (submeshes.count * size_of(u32)) });
+  submesh_stream := create_buffer(*resource_allocator, .{ size = xx (submeshes.count * size_of(u32)), name = "submesh_stream" });
   {
     ptr: *u32 = xx upload_ptr;
     for submeshes {
@@ -918,7 +968,7 @@ load_gltf_scene :: (device: *Device, path: string) -> Scene, bool {
     wait_for_completion(device);
   }
 
-  transform_stream := create_buffer(*resource_allocator, .{ size = xx (nodes.count * size_of(Vector3) * 4) });
+  transform_stream := create_buffer(*resource_allocator, .{ size = xx (nodes.count * size_of(Vector3) * 4), name = "transform_stream" });
   {
     ptr: *Vector3 = xx upload_ptr;
     for nodes {

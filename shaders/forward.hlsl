@@ -38,7 +38,7 @@ struct Submesh {
 };
 
 struct Material {
-  uint albedo_id;
+  uint texture_descriptor_offset;
 };
 
 struct DrawData {
@@ -65,7 +65,6 @@ Interpolator vs(Vertex vertex) {
   float3x4 object_to_world = transforms.Load<Transform>(draw_data.transform_index * sizeof(Transform)).object_to_world;
   float3 position_ws = mul(object_to_world, float4(vertex.position, 1.0));
   float3 position_vs = mul(globals.world_to_view, float4(position_ws, 1.0)).xyz;
-  //float3 position_ws = mul(globals.world_to_view, float4(vertex.position, 1.0)).xyz;
   i.position = mul(globals.proj, float4(position_vs, 1.0));
   i.normal = vertex.normal;
   //i.tangent = vertex.tangent;
@@ -78,8 +77,12 @@ Interpolator vs(Vertex vertex) {
 float4 ps(Interpolator i) : SV_Target {
   Submesh submesh = submeshes.Load<Submesh>(draw_data.submesh_id * sizeof(Submesh));
   Material material = materials.Load<Material>(submesh.material_id * sizeof(Material));
-  Texture2D albedo_texture = ResourceDescriptorHeap[material.albedo_id];
+  Texture2D albedo_texture = ResourceDescriptorHeap[material.texture_descriptor_offset + 0];
+  Texture2D normal_texture = ResourceDescriptorHeap[material.texture_descriptor_offset + 1];
+  Texture2D metallic_roughness_texture = ResourceDescriptorHeap[material.texture_descriptor_offset + 2];
   float4 albedo = albedo_texture.Sample(material_sampler, i.uv);
+  float4 normal = normal_texture.Sample(material_sampler, i.uv);
+  float4 metallic_roughness = metallic_roughness_texture.Sample(material_sampler, i.uv);
 
-  return albedo;
+  return metallic_roughness;
 }
