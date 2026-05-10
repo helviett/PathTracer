@@ -1,4 +1,4 @@
-Device :: struct {
+DeviceD3D12 :: struct {
   factory: *IDXGIFactory6;
   debug: *ID3D12Debug1;
   adapter: *IDXGIAdapter2;
@@ -19,17 +19,20 @@ Device :: struct {
   root_sigantures: ObjectPool(RootSignatureD3D12, RootSignature);
   memory_heaps: ObjectPool(MemoryHeapD3D12, MemoryHeap);
   descriptor_heaps: ObjectPool(DescriptorHeapD3D12, DescriptorHeap);
+  // TODO: resizable array that is backed by large preallocated virtual address space
+  cmds: [128]CmdD3D12;
+  free_cmd_index: s64;
 }
 
 Swapchain :: struct {
   handle: *IDXGISwapChain3;
   textures: [3]Texture;
-  device: *Device;
+  device: Device;
 }
 
-Cmd :: struct {
+CmdD3D12 :: struct {
   cmd: *ID3D12GraphicsCommandList7;
-  device: *Device;
+  device: Device;
   allocator: *ID3D12CommandAllocator;
   rtv_heap: *ID3D12DescriptorHeap;
   dsv_heap: *ID3D12DescriptorHeap;
@@ -131,13 +134,13 @@ create_device :: () -> Device, bool {
   factory2 : *IDXGIFactory2;
   result := CreateDXGIFactory2(dxgi_factory_flags, *uid(IDXGIFactory2_UUID), xx *factory2);
 
-  rif(result, "Failed to create IDXGIFactory2");
+  rif_handle(result, "Failed to create IDXGIFactory2");
 
   factory6 : *IDXGIFactory6;
 
   result = IUnknown_QueryInterface(factory2, *uid(IDXGIFactory6_UUID), xx *factory6);
 
-  rif(result, "Factory doesn't support IDXGIFactory6 interface");
+  rif_handle(result, "Factory doesn't support IDXGIFactory6 interface");
 
   adapter_index: u32;
   adapter: *IDXGIAdapter2;
@@ -160,7 +163,7 @@ create_device :: () -> Device, bool {
 
   result = D3D12CreateDevice(adapter, .D3D_FEATURE_LEVEL_12_2, *uid(ID3D12Device10_UUID), xx *device);
 
-  rif(result, "Failed to create ID3D12Device10");
+  rif_handle(result, "Failed to create ID3D12Device10");
 
   options12: D3D12_FEATURE_DATA_D3D12_OPTIONS12;
 
@@ -168,7 +171,7 @@ create_device :: () -> Device, bool {
 
   if !options12.EnhancedBarriersSupported {
     print("Enhanced barriers unsupported");
-    return .{}, false;
+    return xx null_handle, false;
   }
 
   queue_desc := D3D12_COMMAND_QUEUE_DESC.{
@@ -180,19 +183,20 @@ create_device :: () -> Device, bool {
 
   result = ID3D12Device_CreateCommandQueue(device, *queue_desc, *uid(ID3D12CommandQueue_UUID), xx *queue);
 
-  rif(result, "Failed to reate ID3D12CommandQueue");
+  rif_handle(result, "Failed to reate ID3D12CommandQueue");
 
   info_queue: *ID3D12InfoQueue1;
 
   if dxgi_factory_flags & DXGI_CREATE_FACTORY_DEBUG {
     result = IUnknown_QueryInterface(device, *uid(ID3D12InfoQueue1_UUID), xx *info_queue);
 
-    rif(result, "Failed to acquire ID3D12InfoQueue1");
+    rif_handle(result, "Failed to acquire ID3D12InfoQueue1");
 
     result = ID3D12InfoQueue1_RegisterMessageCallback(info_queue, debug_callback, .FLAG_NONE, null, *cookie);
   }
 
-  result_device := Device.{
+  result_device : =New(DeviceD3D12);
+  result_device.* = DeviceD3D12.{
     factory = factory6,
     debug = debug,
     adapter = adapter,
@@ -207,23 +211,25 @@ create_device :: () -> Device, bool {
   };
 
   is_created: bool;
-  result_device.wait_idle_fence, is_created = create_fence(*result_device);
+  result_device.wait_idle_fence, is_created = create_fence(xx result_device);
 
-  return result_device, is_created;
+  return xx result_device, is_created;
 }
 
-destroy :: (device: *Device) -> () {
-  release(device.queue);
-  release(device.device);
-  release(device.adapter);
-  release(device.factory);
-  release(device.debug);
+destroy :: (device: Device) -> () {
+  d3d12_device: *DeviceD3D12 = xx device;
+  release(d3d12_device.queue);
+  release(d3d12_device.device);
+  release(d3d12_device.adapter);
+  release(d3d12_device.factory);
+  release(d3d12_device.debug);
 
-  assert(device.textures.objects.count == 0);
-  reset(*device.textures);
+  assert(d3d12_device.textures.objects.count == 0);
+  reset(*d3d12_device.textures);
 }
 
-create_swapchain :: (device: *Device, desc: SwapchainDesc) -> Swapchain, bool {
+create_swapchain :: (device: Device, desc: SwapchainDesc) -> Swapchain, bool {
+  d3d12_device: *DeviceD3D12 = xx device;
   format :: Format.r8g8b8a8_unorm;
   dxgi_desc := DXGI_SWAP_CHAIN_DESC1.{
     Width = desc.width,
@@ -239,8 +245,8 @@ create_swapchain :: (device: *Device, desc: SwapchainDesc) -> Swapchain, bool {
 
   dxgi_swapchain: *IDXGISwapChain1;
   result := IDXGIFactory2_CreateSwapChainForHwnd(
-    device.factory,
-    device.queue,
+    d3d12_device.factory,
+    d3d12_device.queue,
     desc.hwnd,
     *dxgi_desc,
     null,
@@ -256,7 +262,7 @@ create_swapchain :: (device: *Device, desc: SwapchainDesc) -> Swapchain, bool {
   rif(result, "Unable to query ID3D12SwapChain3 interface");
 
   flags : DXGI_MWA : .NO_WINDOW_CHANGES | .NO_ALT_ENTER;
-  result = IDXGIFactory_MakeWindowAssociation(device.factory, desc.hwnd, xx flags);
+  result = IDXGIFactory_MakeWindowAssociation(d3d12_device.factory, desc.hwnd, xx flags);
 
   rif(result, "Unable to associate window with swapchain");
 
@@ -271,15 +277,16 @@ create_swapchain :: (device: *Device, desc: SwapchainDesc) -> Swapchain, bool {
       height = desc.height,
     };
     IDXGISwapChain_GetBuffer(dxgi_swapchain, xx it, *uid(ID3D12Resource_UUID), xx *texture.handle);
-    swapchain.textures[it] = add_object(*device.textures, texture);
+    swapchain.textures[it] = add_object(*d3d12_device.textures, texture);
   }
 
   return swapchain, true;
 }
 
 destroy :: (using swapchain: *Swapchain) {
+  d3d12_device: *DeviceD3D12 = xx device;
   for textures {
-    remove_object(*device.textures, it);
+    remove_object(*d3d12_device.textures, it);
   }
 
   release(handle);
@@ -294,14 +301,16 @@ get_next_texture :: (using swapchain: *Swapchain) -> Texture {
   return textures[idx];
 }
 
-create_cmd :: (device: *Device) -> Cmd, bool {
+create_cmd :: (device: Device) -> Cmd, bool {
+  d3d12_device: *DeviceD3D12 = xx device;
+  assert(d3d12_device.free_cmd_index < d3d12_device.cmds.count);
   allocator: *ID3D12CommandAllocator;
-  result := ID3D12Device_CreateCommandAllocator(device.device, .DIRECT, *uid(ID3D12CommandAllocator_UUID), xx *allocator);
+  result := ID3D12Device_CreateCommandAllocator(d3d12_device.device, .DIRECT, *uid(ID3D12CommandAllocator_UUID), xx *allocator);
 
-  rif(result, "Unable to create ID3D12CommandAllocator");
+  rif_handle(result, "Unable to create ID3D12CommandAllocator");
 
   cmd_list: *ID3D12GraphicsCommandList7;
-  result = ID3D12Device4_CreateCommandList1(device.device, 0, .DIRECT, 0, *uid(ID3D12GraphicsCommandList7_UUID), xx *cmd_list);
+  result = ID3D12Device4_CreateCommandList1(d3d12_device.device, 0, .DIRECT, 0, *uid(ID3D12GraphicsCommandList7_UUID), xx *cmd_list);
 
   rtv_heap_desc := D3D12_DESCRIPTOR_HEAP_DESC.{
     Type = .RTV,
@@ -310,9 +319,9 @@ create_cmd :: (device: *Device) -> Cmd, bool {
     NodeMask = 0,
   };
   rtv_heap: *ID3D12DescriptorHeap;
-  result = ID3D12Device_CreateDescriptorHeap(device.device, *rtv_heap_desc, *uid(ID3D12DescriptorHeap_UUID), xx *rtv_heap);
+  result = ID3D12Device_CreateDescriptorHeap(d3d12_device.device, *rtv_heap_desc, *uid(ID3D12DescriptorHeap_UUID), xx *rtv_heap);
 
-  rif(result, "Failed to create RTV ID3D12DescriptorHeap");
+  rif_handle(result, "Failed to create RTV ID3D12DescriptorHeap");
 
 
   dsv_heap_desc := D3D12_DESCRIPTOR_HEAP_DESC.{
@@ -322,33 +331,42 @@ create_cmd :: (device: *Device) -> Cmd, bool {
     NodeMask = 0,
   };
   dsv_heap: *ID3D12DescriptorHeap;
-  result = ID3D12Device_CreateDescriptorHeap(device.device, *dsv_heap_desc, *uid(ID3D12DescriptorHeap_UUID), xx *dsv_heap);
+  result = ID3D12Device_CreateDescriptorHeap(d3d12_device.device, *dsv_heap_desc, *uid(ID3D12DescriptorHeap_UUID), xx *dsv_heap);
 
-  return .{
+  d3d12_device.cmds[d3d12_device.free_cmd_index] =  .{
     cmd = cmd_list,
     device = device,
     allocator = allocator,
     rtv_heap = rtv_heap,
     dsv_heap = dsv_heap,
-  }, true;
+  };
+
+  d3d12_device.free_cmd_index += 1;
+
+  return xx *d3d12_device.cmds[d3d12_device.free_cmd_index - 1], true;
 }
 
-destroy :: (device: *Device, cmd: *Cmd) {
-  release(cmd.cmd);
-  release(cmd.allocator);
+destroy :: (device: Device, cmd: Cmd) {
+  d3d12_device: *DeviceD3D12 = xx device;
+  d3d12_cmd: *CmdD3D12 = xx cmd;
+  release(d3d12_cmd.cmd);
+  release(d3d12_cmd.allocator);
 }
 
-begin :: (cmd: *Cmd) {
-  ID3D12CommandAllocator_Reset(cmd.allocator);
-  ID3D12GraphicsCommandList_Reset(cmd.cmd, cmd.allocator, null);
-  ID3D12GraphicsCommandList_IASetPrimitiveTopology(cmd.cmd, .TRIANGLELIST);
+begin :: (cmd: Cmd) {
+  d3d12_cmd: *CmdD3D12 = xx cmd;
+  ID3D12CommandAllocator_Reset(d3d12_cmd.allocator);
+  ID3D12GraphicsCommandList_Reset(d3d12_cmd.cmd, d3d12_cmd.allocator, null);
+  ID3D12GraphicsCommandList_IASetPrimitiveTopology(d3d12_cmd.cmd, .TRIANGLELIST);
 }
 
-end :: (cmd: *Cmd) {
-  ID3D12GraphicsCommandList_Close(cmd.cmd);
+end :: (cmd: Cmd) {
+  d3d12_cmd: *CmdD3D12 = xx cmd;
+  ID3D12GraphicsCommandList_Close(d3d12_cmd.cmd);
 }
 
-set_viewport :: (cmd: *Cmd, viewport: Viewport) {
+set_viewport :: (cmd: Cmd, viewport: Viewport) {
+  d3d12_cmd: *CmdD3D12 = xx cmd;
   d3d12_viewport := D3D12_VIEWPORT.{
     TopLeftX = viewport.x,
     TopLeftY = viewport.y,
@@ -357,10 +375,11 @@ set_viewport :: (cmd: *Cmd, viewport: Viewport) {
     MinDepth = viewport.min_depth,
     MaxDepth = viewport.max_depth,
   };
-  ID3D12GraphicsCommandList_RSSetViewports(cmd.cmd, 1, *d3d12_viewport);
+  ID3D12GraphicsCommandList_RSSetViewports(d3d12_cmd.cmd, 1, *d3d12_viewport);
 }
 
-set_scissor :: (cmd: *Cmd, scissor: Scissor) {
+set_scissor :: (cmd: Cmd, scissor: Scissor) {
+  d3d12_cmd: *CmdD3D12 = xx cmd;
   d3d12_scissor := RECT.{
     left = cast(s32)scissor.x,
     top = cast(s32)scissor.y,
@@ -368,7 +387,7 @@ set_scissor :: (cmd: *Cmd, scissor: Scissor) {
     bottom = cast(s32)(scissor.y + scissor.height),
   };
 
-  ID3D12GraphicsCommandList_RSSetScissorRects(cmd.cmd, 1, *d3d12_scissor);
+  ID3D12GraphicsCommandList_RSSetScissorRects(d3d12_cmd.cmd, 1, *d3d12_scissor);
 }
 
 sync_stage_to_d3d12_sync_and_access :: (stage: SyncStage) -> D3D12_BARRIER_SYNC, D3D12_BARRIER_ACCESS {
@@ -497,7 +516,9 @@ keep_compatible_bits :: inline (layout: D3D12_BARRIER_LAYOUT, sync: D3D12_BARRIE
   return compatible_sync, compatible_access;
 }
 
-barrier :: (cmd: *Cmd, before: SyncStage, after: SyncStage, layout_transitions: []LayoutTransition) {
+barrier :: (cmd: Cmd, before: SyncStage, after: SyncStage, layout_transitions: []LayoutTransition) {
+  d3d12_cmd: *CmdD3D12 = xx cmd;
+  d3d12_device: *DeviceD3D12 = xx d3d12_cmd.device;
   auto_release_temp();
   group_count : u32 = 0;
   groups := D3D12_BARRIER_GROUP.[.{}, .{}];
@@ -531,7 +552,7 @@ barrier :: (cmd: *Cmd, before: SyncStage, after: SyncStage, layout_transitions: 
       b.LayoutAfter = layout_to_d3d12_layout(t.after);
       b.SyncBefore, b.AccessBefore = keep_compatible_bits(b.LayoutBefore, global_barrier.SyncBefore, global_barrier.AccessBefore);
       b.SyncAfter, b.AccessAfter = keep_compatible_bits(b.LayoutAfter, global_barrier.SyncAfter, global_barrier.AccessAfter);
-      b.pResource = get_object(cmd.device.textures, t.texture).handle;
+      b.pResource = get_object(d3d12_device.textures, t.texture).handle;
       b.Subresources.IndexOrFirstMipLevel = 0xFFFFFFFF;
 
       all_sync_before |= b.SyncBefore;
@@ -565,80 +586,94 @@ barrier :: (cmd: *Cmd, before: SyncStage, after: SyncStage, layout_transitions: 
     }
   }
 
-  ID3D12GraphicsCommandList7_Barrier(cmd.cmd, group_count, *groups[0]);
+  ID3D12GraphicsCommandList7_Barrier(d3d12_cmd.cmd, group_count, *groups[0]);
 }
 
-clear_render_target :: (cmd: *Cmd, rt: Texture, clear_color: ClearColor) {
-  d3d12_rt := get_object(cmd.device.textures, rt);
+clear_render_target :: (cmd: Cmd, rt: Texture, clear_color: ClearColor) {
+  d3d12_cmd: *CmdD3D12 = xx cmd;
+  d3d12_device: *DeviceD3D12 = xx d3d12_cmd.device;
+  d3d12_rt := get_object(d3d12_device.textures, rt);
 
-  handle := ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(cmd.rtv_heap);
-  ID3D12Device_CreateRenderTargetView(cmd.device.device, d3d12_rt.handle, null, handle);
+  handle := ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(d3d12_cmd.rtv_heap);
+  ID3D12Device_CreateRenderTargetView(d3d12_device.device, d3d12_rt.handle, null, handle);
   d3d12_clear_color := float.[clear_color.r, clear_color.g, clear_color.b, clear_color.a];
 
-  ID3D12GraphicsCommandList_ClearRenderTargetView(cmd.cmd, handle, *d3d12_clear_color, 0, null);
+  ID3D12GraphicsCommandList_ClearRenderTargetView(d3d12_cmd.cmd, handle, *d3d12_clear_color, 0, null);
 }
 
-clear_depth_stencil_target :: (cmd: *Cmd, ds: Texture, clear_value: ClearDepthStencil) {
-  d3d12_ds := get_object(cmd.device.textures, ds);
+clear_depth_stencil_target :: (cmd: Cmd, ds: Texture, clear_value: ClearDepthStencil) {
+  d3d12_cmd: *CmdD3D12 = xx cmd;
+  d3d12_device: *DeviceD3D12 = xx d3d12_cmd.device;
+  d3d12_ds := get_object(d3d12_device.textures, ds);
 
-  handle := ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(cmd.dsv_heap);
-  ID3D12Device_CreateDepthStencilView(cmd.device.device, d3d12_ds.handle, null, handle);
+  handle := ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(d3d12_cmd.dsv_heap);
+  ID3D12Device_CreateDepthStencilView(d3d12_device.device, d3d12_ds.handle, null, handle);
 
-  ID3D12GraphicsCommandList_ClearDepthStencilView(cmd.cmd, handle, .DEPTH | .STENCIL, clear_value.depth, clear_value.stencil, 0, null);
+  ID3D12GraphicsCommandList_ClearDepthStencilView(d3d12_cmd.cmd, handle, .DEPTH | .STENCIL, clear_value.depth, clear_value.stencil, 0, null);
 }
 
-set_targets :: (cmd: *Cmd, color_targets: []Texture, depth_target: Texture) {
-  rtv_head := ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(cmd.rtv_heap);
+set_targets :: (cmd: Cmd, color_targets: []Texture, depth_target: Texture) {
+  d3d12_cmd: *CmdD3D12 = xx cmd;
+  d3d12_device: *DeviceD3D12 = xx d3d12_cmd.device;
+  rtv_head := ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(d3d12_cmd.rtv_heap);
   rtv_handle_ptr :*D3D12_CPU_DESCRIPTOR_HANDLE;
 
   if color_targets {
     rtv_handle_ptr = *rtv_head;
 
     for color_targets {
-      handle := D3D12_CPU_DESCRIPTOR_HANDLE.{ ptr = rtv_head.ptr + cast(u64) it_index * cmd.device.rtv_descriptor_size };
-      d3d12_color_target := get_object(cmd.device.textures, it);
-      ID3D12Device_CreateRenderTargetView(cmd.device.device, d3d12_color_target.handle, null, handle);
+      handle := D3D12_CPU_DESCRIPTOR_HANDLE.{ ptr = rtv_head.ptr + cast(u64) it_index * d3d12_device.rtv_descriptor_size };
+      d3d12_color_target := get_object(d3d12_device.textures, it);
+      ID3D12Device_CreateRenderTargetView(d3d12_device.device, d3d12_color_target.handle, null, handle);
     }
   }
 
   dsv_handle_ptr :*D3D12_CPU_DESCRIPTOR_HANDLE;
 
   if depth_target != xx null_handle {
-    handle := ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(cmd.dsv_heap);
-    d3d12_depth_target := get_object(cmd.device.textures, depth_target);
-    ID3D12Device_CreateDepthStencilView(cmd.device.device, d3d12_depth_target.handle, null, handle);
+    handle := ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(d3d12_cmd.dsv_heap);
+    d3d12_depth_target := get_object(d3d12_device.textures, depth_target);
+    ID3D12Device_CreateDepthStencilView(d3d12_device.device, d3d12_depth_target.handle, null, handle);
     dsv_handle_ptr = *handle;
   }
 
-  ID3D12GraphicsCommandList_OMSetRenderTargets(cmd.cmd, xx color_targets.count, rtv_handle_ptr, .TRUE, dsv_handle_ptr);
+  ID3D12GraphicsCommandList_OMSetRenderTargets(d3d12_cmd.cmd, xx color_targets.count, rtv_handle_ptr, .TRUE, dsv_handle_ptr);
 }
 
-set_root_signature :: (cmd: *Cmd, root_siganture: RootSignature) {
-  handle: *ID3D12RootSignature = get_object(cmd.device.root_sigantures, root_siganture).handle;
-  ID3D12GraphicsCommandList_SetGraphicsRootSignature(cmd.cmd, handle);
-  ID3D12GraphicsCommandList_SetComputeRootSignature(cmd.cmd, handle);
+set_root_signature :: (cmd: Cmd, root_siganture: RootSignature) {
+  d3d12_cmd: *CmdD3D12 = xx cmd;
+  d3d12_device: *DeviceD3D12 = xx d3d12_cmd.device;
+  handle: *ID3D12RootSignature = get_object(d3d12_device.root_sigantures, root_siganture).handle;
+  ID3D12GraphicsCommandList_SetGraphicsRootSignature(d3d12_cmd.cmd, handle);
+  ID3D12GraphicsCommandList_SetComputeRootSignature(d3d12_cmd.cmd, handle);
 }
 
-set_pipeline :: (cmd: *Cmd, pipeline: Pipeline) {
-  ID3D12GraphicsCommandList_SetPipelineState(cmd.cmd, get_object(cmd.device.pipelines, pipeline).handle);
+set_pipeline :: (cmd: Cmd, pipeline: Pipeline) {
+  d3d12_cmd: *CmdD3D12 = xx cmd;
+  d3d12_device: *DeviceD3D12 = xx d3d12_cmd.device;
+  ID3D12GraphicsCommandList_SetPipelineState(d3d12_cmd.cmd, get_object(d3d12_device.pipelines, pipeline).handle);
 }
 
-set_index_buffer :: (cmd: *Cmd, buffer: Buffer, index_type: IndexType, offset: u64) {
-  d3d12_buffer := get_object(cmd.device.buffers, buffer);
+set_index_buffer :: (cmd: Cmd, buffer: Buffer, index_type: IndexType, offset: u64) {
+  d3d12_cmd: *CmdD3D12 = xx cmd;
+  d3d12_device: *DeviceD3D12 = xx d3d12_cmd.device;
+  d3d12_buffer := get_object(d3d12_device.buffers, buffer);
   view := D3D12_INDEX_BUFFER_VIEW.{
     BufferLocation = ID3D12Resource_GetGPUVirtualAddress(d3d12_buffer.handle) + offset,
     SizeInBytes = xx d3d12_buffer.size,
     Format = ifx index_type == .r16_uint then .R16_UINT else .R32_UINT,
   };
-  ID3D12GraphicsCommandList_IASetIndexBuffer(cmd.cmd, *view);
+  ID3D12GraphicsCommandList_IASetIndexBuffer(d3d12_cmd.cmd, *view);
 }
 
-set_vertex_buffers :: (cmd: *Cmd, first_binding: u32, bindings: []VertexBufferBinding) {
+set_vertex_buffers :: (cmd: Cmd, first_binding: u32, bindings: []VertexBufferBinding) {
+  d3d12_cmd: *CmdD3D12 = xx cmd;
+  d3d12_device: *DeviceD3D12 = xx d3d12_cmd.device;
   auto_release_temp();
   views := NewArray(bindings.count, D3D12_VERTEX_BUFFER_VIEW, initialized = false);
 
   for bindings {
-    d3d12_buffer := get_object(cmd.device.buffers, it.buffer);
+    d3d12_buffer := get_object(d3d12_device.buffers, it.buffer);
     views[it_index] = D3D12_VERTEX_BUFFER_VIEW.{
       BufferLocation = ID3D12Resource_GetGPUVirtualAddress(d3d12_buffer.handle) + it.offset,
       SizeInBytes = xx d3d12_buffer.size,
@@ -646,27 +681,33 @@ set_vertex_buffers :: (cmd: *Cmd, first_binding: u32, bindings: []VertexBufferBi
     };
   }
 
-  ID3D12GraphicsCommandList_IASetVertexBuffers(cmd.cmd, first_binding, xx views.count, views.data);
+  ID3D12GraphicsCommandList_IASetVertexBuffers(d3d12_cmd.cmd, first_binding, xx views.count, views.data);
 }
 
-draw :: (cmd: *Cmd, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) {
-  ID3D12GraphicsCommandList_DrawInstanced(cmd.cmd, vertex_count, instance_count, first_vertex, first_instance);
+draw :: (cmd: Cmd, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) {
+  d3d12_cmd: *CmdD3D12 = xx cmd;
+  ID3D12GraphicsCommandList_DrawInstanced(d3d12_cmd.cmd, vertex_count, instance_count, first_vertex, first_instance);
 }
 
-draw_indexed :: (cmd: *Cmd, index_count: u32, instance_count: u32, first_index: u32, vertex_offset: s32, first_instance: u32) {
-  ID3D12GraphicsCommandList_DrawIndexedInstanced(cmd.cmd, index_count, instance_count, first_index, vertex_offset, first_instance);
+draw_indexed :: (cmd: Cmd, index_count: u32, instance_count: u32, first_index: u32, vertex_offset: s32, first_instance: u32) {
+  d3d12_cmd: *CmdD3D12 = xx cmd;
+  ID3D12GraphicsCommandList_DrawIndexedInstanced(d3d12_cmd.cmd, index_count, instance_count, first_index, vertex_offset, first_instance);
 }
 
-copy :: (cmd: *Cmd, copy: BufferCopy) {
-  d3d12_dst := get_object(cmd.device.buffers, copy.dst).handle;
-  d3d12_src := get_object(cmd.device.buffers, copy.src).handle;
+copy :: (cmd: Cmd, copy: BufferCopy) {
+  d3d12_cmd: *CmdD3D12 = xx cmd;
+  d3d12_device: *DeviceD3D12 = xx d3d12_cmd.device;
+  d3d12_dst := get_object(d3d12_device.buffers, copy.dst).handle;
+  d3d12_src := get_object(d3d12_device.buffers, copy.src).handle;
 
-  ID3D12GraphicsCommandList_CopyBufferRegion(cmd.cmd, d3d12_dst, copy.dst_offset, d3d12_src, copy.src_offset, copy.size);
+  ID3D12GraphicsCommandList_CopyBufferRegion(d3d12_cmd.cmd, d3d12_dst, copy.dst_offset, d3d12_src, copy.src_offset, copy.size);
 }
 
-copy :: (cmd: *Cmd, copy: TextureCopy) {
-  d3d12_dst := get_object(cmd.device.textures, copy.dst).handle;
-  d3d12_src := get_object(cmd.device.textures, copy.src).handle;
+copy :: (cmd: Cmd, copy: TextureCopy) {
+  d3d12_cmd: *CmdD3D12 = xx cmd;
+  d3d12_device: *DeviceD3D12 = xx d3d12_cmd.device;
+  d3d12_dst := get_object(d3d12_device.textures, copy.dst).handle;
+  d3d12_src := get_object(d3d12_device.textures, copy.src).handle;
   dst_location := D3D12_TEXTURE_COPY_LOCATION.{
     pResource = d3d12_dst,
     Type = .SUBRESOURCE_INDEX,
@@ -687,12 +728,14 @@ copy :: (cmd: *Cmd, copy: TextureCopy) {
   };
 
   ID3D12GraphicsCommandList_CopyTextureRegion(
-    cmd.cmd, *dst_location, copy.dst_x, copy.dst_y, 0, *src_location, *src_box);
+    d3d12_cmd.cmd, *dst_location, copy.dst_x, copy.dst_y, 0, *src_location, *src_box);
 }
 
-copy :: (cmd: *Cmd, copy: BufferToTextureCopy) {
-  d3d12_dst := get_object(cmd.device.textures, copy.texture);
-  d3d12_src := get_object(cmd.device.buffers, copy.buffer);
+copy :: (cmd: Cmd, copy: BufferToTextureCopy) {
+  d3d12_cmd: *CmdD3D12 = xx cmd;
+  d3d12_device: *DeviceD3D12 = xx d3d12_cmd.device;
+  d3d12_dst := get_object(d3d12_device.textures, copy.texture);
+  d3d12_src := get_object(d3d12_device.buffers, copy.buffer);
   dst_location := D3D12_TEXTURE_COPY_LOCATION.{
     pResource = d3d12_dst.handle,
     Type = .SUBRESOURCE_INDEX,
@@ -716,66 +759,81 @@ copy :: (cmd: *Cmd, copy: BufferToTextureCopy) {
   };
 
   ID3D12GraphicsCommandList_CopyTextureRegion(
-    cmd.cmd, *dst_location, copy.texture_x, copy.texture_y, 0, *src_location, null);
+    d3d12_cmd.cmd, *dst_location, copy.texture_x, copy.texture_y, 0, *src_location, null);
 }
 
-copy :: (cmd: *Cmd, copy: TextureToBufferCopy) {
+copy :: (cmd: Cmd, copy: TextureToBufferCopy) {
+  d3d12_cmd: *CmdD3D12 = xx cmd;
   assert(false);
 }
 
-set_descriptor_heaps :: (cmd: *Cmd, heaps: []DescriptorHeap) {
+set_descriptor_heaps :: (cmd: Cmd, heaps: []DescriptorHeap) {
+  d3d12_cmd: *CmdD3D12 = xx cmd;
+  d3d12_device: *DeviceD3D12 = xx d3d12_cmd.device;
   auto_release_temp();
   d3d12_heaps := NewArray(heaps.count, *ID3D12DescriptorHeap,, allocator=temp);
 
   for heaps {
-    d3d12_heaps[it_index] = get_object(cmd.device.descriptor_heaps, it).handle;
+    d3d12_heaps[it_index] = get_object(d3d12_device.descriptor_heaps, it).handle;
   }
 
-  ID3D12GraphicsCommandList_SetDescriptorHeaps(cmd.cmd, xx heaps.count, d3d12_heaps.data);
+  ID3D12GraphicsCommandList_SetDescriptorHeaps(d3d12_cmd.cmd, xx heaps.count, d3d12_heaps.data);
 }
 
-set_root_constants :: (cmd: *Cmd, root_index: u32, constants: *void, size: u64) {
+set_root_constants :: (cmd: Cmd, root_index: u32, constants: *void, size: u64) {
+  d3d12_cmd: *CmdD3D12 = xx cmd;
   assert(size % size_of(u32) == 0);
-  ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(cmd.cmd, root_index, xx (size / size_of(u32)), constants, 0);
-  ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(cmd.cmd, root_index, xx (size / size_of(u32)), constants, 0);
+  ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(d3d12_cmd.cmd, root_index, xx (size / size_of(u32)), constants, 0);
+  ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(d3d12_cmd.cmd, root_index, xx (size / size_of(u32)), constants, 0);
 }
 
-set_root_constants :: (cmd: *Cmd, root_index: u32, constants: $T) #expand {
+set_root_constants :: (cmd: Cmd, root_index: u32, constants: $T) #expand {
+  d3d12_cmd: *CmdD3D12 = xx cmd;
   set_root_constants(cmd, root_index, *constants, size_of(T));
 }
 
-set_root_cbv :: (cmd: *Cmd, root_index: u32, buffer: Buffer, offset: u64 = 0) {
-  addr := ID3D12Resource_GetGPUVirtualAddress(get_object(cmd.device.buffers, buffer).handle);
+set_root_cbv :: (cmd: Cmd, root_index: u32, buffer: Buffer, offset: u64 = 0) {
+  d3d12_cmd: *CmdD3D12 = xx cmd;
+  d3d12_device: *DeviceD3D12 = xx d3d12_cmd.device;
+  addr := ID3D12Resource_GetGPUVirtualAddress(get_object(d3d12_device.buffers, buffer).handle);
   addr += offset;
-  ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(cmd.cmd, root_index, addr);
-  ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(cmd.cmd, root_index, addr);
+  ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(d3d12_cmd.cmd, root_index, addr);
+  ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(d3d12_cmd.cmd, root_index, addr);
 }
 
-set_root_srv :: (cmd: *Cmd, root_index: u32, buffer: Buffer, offset: u64 = 0) {
-  addr := ID3D12Resource_GetGPUVirtualAddress(get_object(cmd.device.buffers, buffer).handle);
+set_root_srv :: (cmd: Cmd, root_index: u32, buffer: Buffer, offset: u64 = 0) {
+  d3d12_cmd: *CmdD3D12 = xx cmd;
+  d3d12_device: *DeviceD3D12 = xx d3d12_cmd.device;
+  addr := ID3D12Resource_GetGPUVirtualAddress(get_object(d3d12_device.buffers, buffer).handle);
   addr += offset;
-  ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(cmd.cmd, root_index, addr);
-  ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(cmd.cmd, root_index, addr);
+  ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(d3d12_cmd.cmd, root_index, addr);
+  ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(d3d12_cmd.cmd, root_index, addr);
 }
 
-set_root_uav :: (cmd: *Cmd, root_index: u32, buffer: Buffer, offset: u64 = 0) {
-  addr := ID3D12Resource_GetGPUVirtualAddress(get_object(cmd.device.buffers, buffer).handle);
+set_root_uav :: (cmd: Cmd, root_index: u32, buffer: Buffer, offset: u64 = 0) {
+  d3d12_cmd: *CmdD3D12 = xx cmd;
+  d3d12_device: *DeviceD3D12 = xx d3d12_cmd.device;
+  addr := ID3D12Resource_GetGPUVirtualAddress(get_object(d3d12_device.buffers, buffer).handle);
   addr += offset;
-  ID3D12GraphicsCommandList_SetGraphicsRootUnorderedAccessView(cmd.cmd, root_index, addr);
-  ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(cmd.cmd, root_index, addr);
+  ID3D12GraphicsCommandList_SetGraphicsRootUnorderedAccessView(d3d12_cmd.cmd, root_index, addr);
+  ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(d3d12_cmd.cmd, root_index, addr);
 }
 
-submit :: (device: *Device, cmd: *Cmd) {
-  ID3D12CommandQueue_ExecuteCommandLists(device.queue, 1, xx *cmd.cmd);
+submit :: (device: Device, cmd: Cmd) {
+  d3d12_device: *DeviceD3D12 = xx device;
+  d3d12_cmd: *CmdD3D12 = xx cmd;
+  ID3D12CommandQueue_ExecuteCommandLists(d3d12_device.queue, 1, xx *d3d12_cmd.cmd);
 }
 
-wait_for_completion :: (device: *Device) {
-  value := next_value(*device.wait_idle_fence);
-  signal(device, *device.wait_idle_fence, value);
-  wait_for_fence(device, *device.wait_idle_fence, value);
+wait_for_completion :: (device: Device) {
+  d3d12_device: *DeviceD3D12 = xx device;
+  value := next_value(*d3d12_device.wait_idle_fence);
+  signal(device, *d3d12_device.wait_idle_fence, value);
+  wait_for_fence(device, *d3d12_device.wait_idle_fence, value);
 }
 
-wait_for_fence :: (device: *Device, fence: *Fence, value: u64) {
+wait_for_fence :: (device: Device, fence: *Fence, value: u64) {
+  d3d12_device: *DeviceD3D12 = xx device;
   last_completed_value: u64 = ID3D12Fence_GetCompletedValue(fence.fence);
 
   if (last_completed_value < value) {
@@ -784,13 +842,15 @@ wait_for_fence :: (device: *Device, fence: *Fence, value: u64) {
   }
 }
 
-signal :: (device: *Device, fence: *Fence, value: u64) {
-  ID3D12CommandQueue_Signal(device.queue, fence.fence, value);
+signal :: (device: Device, fence: *Fence, value: u64) {
+  d3d12_device: *DeviceD3D12 = xx device;
+  ID3D12CommandQueue_Signal(d3d12_device.queue, fence.fence, value);
 }
 
-create_fence :: (device: *Device) -> Fence, bool {
+create_fence :: (device: Device) -> Fence, bool {
+  d3d12_device: *DeviceD3D12 = xx device;
   fence: *ID3D12Fence;
-  result := ID3D12Device_CreateFence(device.device, 0, .NONE, *uid(ID3D12Fence_UUID), xx *fence);
+  result := ID3D12Device_CreateFence(d3d12_device.device, 0, .NONE, *uid(ID3D12Fence_UUID), xx *fence);
 
   rif(result, "Failed to create ID3D12Fence");
 
@@ -807,7 +867,8 @@ create_fence :: (device: *Device) -> Fence, bool {
   }, true;
 }
 
-destroy :: (device: *Device, fence: *Fence) {
+destroy :: (device: Device, fence: *Fence) {
+  d3d12_device: *DeviceD3D12 = xx device;
   release(fence.fence);
 }
 
@@ -817,26 +878,29 @@ next_value :: (fence: *Fence) -> u64 {
   return fence.value;
 }
 
-create_shader :: (device: *Device, using desc: ShaderDesc) -> Shader, bool {
-  return add_object(*device.shaders, .{ code = .{ code.data, xx code.count } }), true;
+create_shader :: (device: Device, using desc: ShaderDesc) -> Shader, bool {
+  d3d12_device: *DeviceD3D12 = xx device;
+  return add_object(*d3d12_device.shaders, .{ code = .{ code.data, xx code.count } }), true;
 }
 
-create_root_signature :: (device: *Device, shader: Shader) -> RootSignature, bool {
+create_root_signature :: (device: Device, shader: Shader) -> RootSignature, bool {
+  d3d12_device: *DeviceD3D12 = xx device;
   root_siganture: *ID3D12RootSignature;
-  d3d12_shader := get_object(device.shaders, shader);
-  result := ID3D12Device_CreateRootSignature(device.device, 0, d3d12_shader.code.pShaderBytecode, d3d12_shader.code.BytecodeLength, *uid(ID3D12RootSignature_UUID), xx *root_siganture);
+  d3d12_shader := get_object(d3d12_device.shaders, shader);
+  result := ID3D12Device_CreateRootSignature(d3d12_device.device, 0, d3d12_shader.code.pShaderBytecode, d3d12_shader.code.BytecodeLength, *uid(ID3D12RootSignature_UUID), xx *root_siganture);
   rif_handle(result, "Unable to create root signature");
 
-  return add_object(*device.root_sigantures, .{ handle = root_siganture, }), true;
+  return add_object(*d3d12_device.root_sigantures, .{ handle = root_siganture, }), true;
 }
 
-create_compute_pipeline :: (device: *Device, using desc: ComputePipelineDesc) -> Pipeline, bool {
-  d3d12_shader := get_object(device.shaders, cs);
+create_compute_pipeline :: (device: Device, using desc: ComputePipelineDesc) -> Pipeline, bool {
+  d3d12_device: *DeviceD3D12 = xx device;
+  d3d12_shader := get_object(d3d12_device.shaders, cs);
   d3d12_desc := D3D12_COMPUTE_PIPELINE_STATE_DESC.{ CS = d3d12_shader.code, };
   pipeline: *ID3D12PipelineState;
-  ID3D12Device_CreateComputePipelineState(device.device, *d3d12_desc, *uid(ID3D12PipelineState_UUID), xx *pipeline);
+  ID3D12Device_CreateComputePipelineState(d3d12_device.device, *d3d12_desc, *uid(ID3D12PipelineState_UUID), xx *pipeline);
 
-  return add_object(*device.pipelines, .{ handle = pipeline }), true;
+  return add_object(*d3d12_device.pipelines, .{ handle = pipeline }), true;
 }
 
 semantic_to_wide_string :: inline (semantic: Semantic) -> *u8 {
@@ -925,7 +989,8 @@ MAX_PIPELINE_STATE_STREAM_SIZE :: #run
   + align_pot(size_of(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) + size_of(D3D12_PRIMITIVE_TOPOLOGY_TYPE), size_of(*void))
   + align_pot(size_of(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) + size_of(u32), size_of(*void));
 
-create_graphics_pipeline :: (device: *Device, using desc: GraphicsPipelineDesc) -> Pipeline, bool {
+create_graphics_pipeline :: (device: Device, using desc: GraphicsPipelineDesc) -> Pipeline, bool {
+  d3d12_device: *DeviceD3D12 = xx device;
   auto_release_temp();
   stream_head : *u8 = alloc(MAX_PIPELINE_STATE_STREAM_SIZE,, allocator=temp);
   stream_tail := stream_head;
@@ -937,7 +1002,7 @@ create_graphics_pipeline :: (device: *Device, using desc: GraphicsPipelineDesc) 
   }
 
   if root_siganture != xx null_handle {
-    d3d12_root_signature := get_object(device.root_sigantures, root_siganture);
+    d3d12_root_signature := get_object(d3d12_device.root_sigantures, root_siganture);
     so: struct { type := D3D12_PIPELINE_STATE_SUBOBJECT_TYPE.ROOT_SIGNATURE; root_signature: *ID3D12RootSignature; };
     so.root_signature = d3d12_root_signature.handle;
 
@@ -945,7 +1010,7 @@ create_graphics_pipeline :: (device: *Device, using desc: GraphicsPipelineDesc) 
   }
 
   if vs != xx null_handle {
-    d3d12_vs := get_object(device.shaders, vs);
+    d3d12_vs := get_object(d3d12_device.shaders, vs);
     so: struct { type := D3D12_PIPELINE_STATE_SUBOBJECT_TYPE.VS; vs: D3D12_SHADER_BYTECODE; };
     so.vs = d3d12_vs.code;
 
@@ -953,7 +1018,7 @@ create_graphics_pipeline :: (device: *Device, using desc: GraphicsPipelineDesc) 
   }
 
   if ps != xx null_handle {
-    d3d12_ps := get_object(device.shaders, ps);
+    d3d12_ps := get_object(d3d12_device.shaders, ps);
     so: struct { type := D3D12_PIPELINE_STATE_SUBOBJECT_TYPE.PS; ps: D3D12_SHADER_BYTECODE; };
     so.ps = d3d12_ps.code;
 
@@ -1040,20 +1105,22 @@ create_graphics_pipeline :: (device: *Device, using desc: GraphicsPipelineDesc) 
   pipeline: *ID3D12PipelineState;
 
 
-  result := ID3D12Device2_CreatePipelineState(device.device, *pipeline_stream, *uid(ID3D12PipelineState_UUID), xx *pipeline);
+  result := ID3D12Device2_CreatePipelineState(d3d12_device.device, *pipeline_stream, *uid(ID3D12PipelineState_UUID), xx *pipeline);
   rif_handle(result, "Unable to create pipeline");
 
-  return add_object(*device.pipelines, .{ handle = pipeline, }), true;
+  return add_object(*d3d12_device.pipelines, .{ handle = pipeline, }), true;
 }
 
-destroy :: (device: *Device, pipeline: Pipeline) {
-  d3d12_pipeline, removed := remove_object(*device.pipelines, pipeline);
+destroy :: (device: Device, pipeline: Pipeline) {
+  d3d12_device: *DeviceD3D12 = xx device;
+  d3d12_pipeline, removed := remove_object(*d3d12_device.pipelines, pipeline);
   assert(removed);
 
   release(d3d12_pipeline.handle);
 }
 
-create_memory_heap :: (device: *Device, memory_heap_desc: MemoryHeapDesc) -> MemoryHeap, bool {
+create_memory_heap :: (device: Device, memory_heap_desc: MemoryHeapDesc) -> MemoryHeap, bool {
+  d3d12_device: *DeviceD3D12 = xx device;
   handle: *ID3D12Heap;
 
   d3d12_desc := D3D12_HEAP_DESC.{
@@ -1064,33 +1131,36 @@ create_memory_heap :: (device: *Device, memory_heap_desc: MemoryHeapDesc) -> Mem
     Flags = .ALLOW_ALL_BUFFERS_AND_TEXTURES,
   };
 
-  result := ID3D12Device_CreateHeap(device.device, *d3d12_desc, *uid(ID3D12Heap_UUID), xx *handle);
+  result := ID3D12Device_CreateHeap(d3d12_device.device, *d3d12_desc, *uid(ID3D12Heap_UUID), xx *handle);
   rif_handle(result, "Unable to create memory heap");
 
-  return add_object(*device.memory_heaps, .{ handle = handle }), true;
+  return add_object(*d3d12_device.memory_heaps, .{ handle = handle }), true;
 }
 
-destroy :: (device: *Device, memory_heap: MemoryHeap) {
-  d3d12_memory_heap, removed := remove_object(*device.memory_heaps, memory_heap);
+destroy :: (device: Device, memory_heap: MemoryHeap) {
+  d3d12_device: *DeviceD3D12 = xx device;
+  d3d12_memory_heap, removed := remove_object(*d3d12_device.memory_heaps, memory_heap);
   assert(removed);
 
   release(d3d12_memory_heap.handle);
 }
 
-get_texture_allocation_requirements :: (device: *Device, texture_desc: TextureDesc) -> AllocationRequirements {
+get_texture_allocation_requirements :: (device: Device, texture_desc: TextureDesc) -> AllocationRequirements {
+  d3d12_device: *DeviceD3D12 = xx device;
   resource_desc := texture_desc_to_d3d12(texture_desc);
 
   allocation_info: D3D12_RESOURCE_ALLOCATION_INFO1;
-  ID3D12Device8_GetResourceAllocationInfo2(device.device, 0, 1, *resource_desc, *allocation_info);
+  ID3D12Device8_GetResourceAllocationInfo2(d3d12_device.device, 0, 1, *resource_desc, *allocation_info);
 
   return .{ alignment = allocation_info.Alignment, size = allocation_info.SizeInBytes };
 }
 
-get_buffer_allocation_requirements :: (device: *Device, buffer_desc: BufferDesc) -> AllocationRequirements {
+get_buffer_allocation_requirements :: (device: Device, buffer_desc: BufferDesc) -> AllocationRequirements {
+  d3d12_device: *DeviceD3D12 = xx device;
   resource_desc := buffer_desc_to_d3d12(buffer_desc);
 
   allocation_info: D3D12_RESOURCE_ALLOCATION_INFO1;
-  ID3D12Device8_GetResourceAllocationInfo2(device.device, 0, 1, *resource_desc, *allocation_info);
+  ID3D12Device8_GetResourceAllocationInfo2(d3d12_device.device, 0, 1, *resource_desc, *allocation_info);
 
   return .{ alignment = allocation_info.Alignment, size = allocation_info.SizeInBytes };
 }
@@ -1130,7 +1200,8 @@ texture_usage_to_d3d12 :: inline (usage: TextureUsage) -> D3D12_RESOURCE_FLAGS {
   return flags;
 }
 
-create_texture :: (device: *Device, memory: Memory, texture_desc: TextureDesc) -> Texture, bool {
+create_texture :: (device: Device, memory: Memory, texture_desc: TextureDesc) -> Texture, bool {
+  d3d12_device: *DeviceD3D12 = xx device;
   resource_desc := texture_desc_to_d3d12(texture_desc);
   clear_value := D3D12_CLEAR_VALUE.{
     Format = format_to_dxgi(texture_desc.format),
@@ -1146,11 +1217,11 @@ create_texture :: (device: *Device, memory: Memory, texture_desc: TextureDesc) -
     clear_value.DepthStencil.Stencil = texture_desc.clear_depth_stencil.stencil;
   }
   need_clear_value := resource_desc.Flags & (.ALLOW_RENDER_TARGET | .ALLOW_DEPTH_STENCIL);
-  d3d12_heap := get_object(device.memory_heaps, memory.heap).handle;
+  d3d12_heap := get_object(d3d12_device.memory_heaps, memory.heap).handle;
 
   resource: *ID3D12Resource;
   result := ID3D12Device10_CreatePlacedResource2(
-    device.device,
+    d3d12_device.device,
     d3d12_heap,
     memory.offset,
     *resource_desc,
@@ -1165,7 +1236,7 @@ create_texture :: (device: *Device, memory: Memory, texture_desc: TextureDesc) -
 
   name_object(resource, texture_desc.name);
 
-  return add_object(*device.textures, .{
+  return add_object(*d3d12_device.textures, .{
     format = texture_desc.format,
     mip_count = 1,
     layer_count = 1,
@@ -1176,8 +1247,9 @@ create_texture :: (device: *Device, memory: Memory, texture_desc: TextureDesc) -
   }), true;
 }
 
-destroy :: (device: *Device, texture: Texture) {
-  d3d12_texture, removed := remove_object(*device.textures, texture);
+destroy :: (device: Device, texture: Texture) {
+  d3d12_device: *DeviceD3D12 = xx device;
+  d3d12_texture, removed := remove_object(*d3d12_device.textures, texture);
   assert(removed);
 
   release(d3d12_texture.handle);
@@ -1214,13 +1286,14 @@ buffer_usage_to_d3d12 :: inline (usage: BufferUsage) -> D3D12_RESOURCE_FLAGS {
   return flags;
 }
 
-create_buffer :: (device: *Device, memory: Memory, buffer_desc: BufferDesc) -> Buffer, bool {
+create_buffer :: (device: Device, memory: Memory, buffer_desc: BufferDesc) -> Buffer, bool {
+  d3d12_device: *DeviceD3D12 = xx device;
   resource_desc := buffer_desc_to_d3d12(buffer_desc);
-  d3d12_heap := get_object(device.memory_heaps, memory.heap).handle;
+  d3d12_heap := get_object(d3d12_device.memory_heaps, memory.heap).handle;
 
   resource: *ID3D12Resource;
   result := ID3D12Device10_CreatePlacedResource2(
-    device.device,
+    d3d12_device.device,
     d3d12_heap,
     memory.offset,
     *resource_desc,
@@ -1235,38 +1308,43 @@ create_buffer :: (device: *Device, memory: Memory, buffer_desc: BufferDesc) -> B
 
   name_object(resource, buffer_desc.name);
 
-  return add_object(*device.buffers, .{ memory = memory, size = buffer_desc.size, handle = resource, }), true;
+  return add_object(*d3d12_device.buffers, .{ memory = memory, size = buffer_desc.size, handle = resource, }), true;
 }
 
-map :: (device: *Device, buffer: Buffer) -> *void {
-  d3d12_buffer := get_object(device.buffers, buffer);
+map :: (device: Device, buffer: Buffer) -> *void {
+  d3d12_device: *DeviceD3D12 = xx device;
+  d3d12_buffer := get_object(d3d12_device.buffers, buffer);
   ID3D12Resource_Map(d3d12_buffer.handle, 0, null, *d3d12_buffer.mapped_ptr);
-  set_object(device.buffers, buffer, d3d12_buffer);
+  set_object(d3d12_device.buffers, buffer, d3d12_buffer);
 
   return d3d12_buffer.mapped_ptr;
 }
 
-unmap :: (device: *Device, buffer: Buffer) -> *void {
-  d3d12_buffer := get_object(device.buffers, buffer);
+unmap :: (device: Device, buffer: Buffer) -> *void {
+  d3d12_device: *DeviceD3D12 = xx device;
+  d3d12_buffer := get_object(d3d12_device.buffers, buffer);
   ID3D12Resource_Unmap(d3d12_buffer.handle, 0, null);
   d3d12_buffer.mapped_ptr = null;
-  set_object(device.device.buffers, buffer, d3d12_buffer);
+  set_object(d3d12_device.d3d12_device.buffers, buffer, d3d12_buffer);
 }
 
-get_mapped_ptr :: (device: *Device, buffer: Buffer) -> *void {
-  d3d12_buffer := get_object(device.buffers, buffer);
+get_mapped_ptr :: (device: Device, buffer: Buffer) -> *void {
+  d3d12_device: *DeviceD3D12 = xx device;
+  d3d12_buffer := get_object(d3d12_device.buffers, buffer);
 
   return d3d12_buffer.mapped_ptr;
 }
 
-destroy :: (device: *Device, buffer: Buffer) {
-  d3d12_buffer, removed := remove_object(*device.buffers, buffer);
+destroy :: (device: Device, buffer: Buffer) {
+  d3d12_device: *DeviceD3D12 = xx device;
+  d3d12_buffer, removed := remove_object(*d3d12_device.buffers, buffer);
   assert(removed);
 
   release(d3d12_buffer.handle);
 }
 
-create_descriptor_heap :: (device: *Device, descriptor_heap_desc: DescriptorHeapDesc) -> DescriptorHeap, bool {
+create_descriptor_heap :: (device: Device, descriptor_heap_desc: DescriptorHeapDesc) -> DescriptorHeap, bool {
+  d3d12_device: *DeviceD3D12 = xx device;
   heap_desc := D3D12_DESCRIPTOR_HEAP_DESC.{
     Type = descriptor_heap_type_to_d3d12(descriptor_heap_desc.type),
     NumDescriptors = descriptor_heap_desc.descriptor_count,
@@ -1274,14 +1352,15 @@ create_descriptor_heap :: (device: *Device, descriptor_heap_desc: DescriptorHeap
     NodeMask = 0,
   };
   heap: *ID3D12DescriptorHeap;
-  result := ID3D12Device_CreateDescriptorHeap(device.device, *heap_desc, *uid(ID3D12DescriptorHeap_UUID), xx *heap);
+  result := ID3D12Device_CreateDescriptorHeap(d3d12_device.device, *heap_desc, *uid(ID3D12DescriptorHeap_UUID), xx *heap);
   rif_handle(result, "Unable to create descriptor heap");
 
-  return add_object(*device.descriptor_heaps, .{ handle = heap, }), false;
+  return add_object(*d3d12_device.descriptor_heaps, .{ handle = heap, }), false;
 }
 
-destroy :: (device: *Device, descriptor_heap: DescriptorHeap) {
-  d3d12_heap, removed := remove_object(*device.descriptor_heaps, descriptor_heap);
+destroy :: (device: Device, descriptor_heap: DescriptorHeap) {
+  d3d12_device: *DeviceD3D12 = xx device;
+  d3d12_heap, removed := remove_object(*d3d12_device.descriptor_heaps, descriptor_heap);
   assert(removed);
 
   release(d3d12_heap.handle);
@@ -1301,20 +1380,21 @@ swizzle_channels :: (r: u32, g: u32, b: u32, a: u32) -> u32 #expand {
 
 ConstantBufferAlignment :: D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
 
-update_descriptors :: (device: *Device, heap: DescriptorHeap, descriptors: []Descriptor) {
-  d3d12_heap := get_object(device.descriptor_heaps, heap);
+update_descriptors :: (device: Device, heap: DescriptorHeap, descriptors: []Descriptor) {
+  d3d12_device: *DeviceD3D12 = xx device;
+  d3d12_heap := get_object(d3d12_device.descriptor_heaps, heap);
   heap_start := ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(d3d12_heap.handle);
 
   for d: descriptors {
     using d;
-    descriptor_handle := D3D12_CPU_DESCRIPTOR_HANDLE.{ ptr = heap_start.ptr + device.cbv_srv_uav_descriptor_size * heap_offset };
+    descriptor_handle := D3D12_CPU_DESCRIPTOR_HANDLE.{ ptr = heap_start.ptr + d3d12_device.cbv_srv_uav_descriptor_size * heap_offset };
 
     if #complete type == {
       case .Undefined; assert(false);
       case .ConstantBuffer; #through;
       case .ShaderResourceBuffer; #through;
       case .UnorderedAccessBuffer;
-        d3d12_buffer := get_object(device.buffers, xx handle);
+        d3d12_buffer := get_object(d3d12_device.buffers, xx handle);
         addr := ID3D12Resource_GetGPUVirtualAddress(d3d12_buffer.handle) + buffer.offset;
         size := ifx buffer.size == RemainingSize then d3d12_buffer.size - buffer.offset else buffer.size;
 
@@ -1322,7 +1402,7 @@ update_descriptors :: (device: *Device, heap: DescriptorHeap, descriptors: []Des
           case .ConstantBuffer;
             size = align_pot(size, ConstantBufferAlignment);
             view := D3D12_CONSTANT_BUFFER_VIEW_DESC.{ BufferLocation = addr, SizeInBytes = xx size, };
-            ID3D12Device_CreateConstantBufferView(device.device, *view, descriptor_handle);
+            ID3D12Device_CreateConstantBufferView(d3d12_device.device, *view, descriptor_handle);
           case .ShaderResourceBuffer;
             view := D3D12_SHADER_RESOURCE_VIEW_DESC.{
               Format = .R32_TYPELESS,
@@ -1330,18 +1410,18 @@ update_descriptors :: (device: *Device, heap: DescriptorHeap, descriptors: []Des
               Shader4ComponentMapping = swizzle_channels(0, 1, 2, 3),
               Buffer = .{ NumElements = xx (size / size_of(u32)), Flags = .RAW, },
             };
-            ID3D12Device_CreateShaderResourceView(device.device, d3d12_buffer.handle, *view, descriptor_handle);
+            ID3D12Device_CreateShaderResourceView(d3d12_device.device, d3d12_buffer.handle, *view, descriptor_handle);
           case .UnorderedAccessBuffer;
             view := D3D12_UNORDERED_ACCESS_VIEW_DESC.{
               Format = .R32_TYPELESS,
               ViewDimension = .BUFFER,
               Buffer = .{ NumElements = xx (size / size_of(u32)), Flags = .RAW, },
             };
-            ID3D12Device_CreateUnorderedAccessView(device.device, d3d12_buffer.handle, null, *view, descriptor_handle);
+            ID3D12Device_CreateUnorderedAccessView(d3d12_device.device, d3d12_buffer.handle, null, *view, descriptor_handle);
         }
       case .ShaderResourceTexture; #through;
       case .UnorderedAccessTexture;
-        d3d12_texture := get_object(device.textures, xx handle);
+        d3d12_texture := get_object(d3d12_device.textures, xx handle);
 
         if type == {
           case .ShaderResourceTexture;
@@ -1354,19 +1434,19 @@ update_descriptors :: (device: *Device, heap: DescriptorHeap, descriptors: []Des
                 MipLevels = ifx texture.mip_count == RemainingMips then cast(u32) 0xFFFFFFFF else texture.mip_count,
               },
             };
-            ID3D12Device_CreateShaderResourceView(device.device, d3d12_texture.handle, *view, descriptor_handle);
+            ID3D12Device_CreateShaderResourceView(d3d12_device.device, d3d12_texture.handle, *view, descriptor_handle);
           case .UnorderedAccessTexture;
             view := D3D12_UNORDERED_ACCESS_VIEW_DESC.{
               Format = format_to_dxgi(d3d12_texture.format),
               ViewDimension = .TEXTURE2D,
               Texture2D = .{ MipSlice = texture.mip_index, },
             };
-            ID3D12Device_CreateUnorderedAccessView(device.device, d3d12_texture.handle, null, *view, descriptor_handle);
+            ID3D12Device_CreateUnorderedAccessView(d3d12_device.device, d3d12_texture.handle, null, *view, descriptor_handle);
         }
       case .Sampler;
-        descriptor_handle = D3D12_CPU_DESCRIPTOR_HANDLE.{ ptr = heap_start.ptr + device.sampler_descriptor_size * heap_offset };
-        d3d12_sampler := get_object(device.samplers, xx handle);
-        ID3D12Device_CreateSampler(device.device, *d3d12_sampler.desc, descriptor_handle);
+        descriptor_handle = D3D12_CPU_DESCRIPTOR_HANDLE.{ ptr = heap_start.ptr + d3d12_device.sampler_descriptor_size * heap_offset };
+        d3d12_sampler := get_object(d3d12_device.samplers, xx handle);
+        ID3D12Device_CreateSampler(d3d12_device.device, *d3d12_sampler.desc, descriptor_handle);
     }
   }
 }
@@ -1386,7 +1466,8 @@ sampler_addressing_to_d3d12 :: inline (address: SamplerAddressMode, address_u: D
   }
 }
 
-create_sampler :: (device: *Device, desc: SamplerDesc) -> Sampler, bool {
+create_sampler :: (device: Device, desc: SamplerDesc) -> Sampler, bool {
+  d3d12_device: *DeviceD3D12 = xx device;
   u := sampler_addressing_to_d3d12(desc.address_u, .WRAP);
   d3d12_desc := D3D12_SAMPLER_DESC.{
     Filter = filters_to_d3d12(desc.min_filter, desc.mag_filter, desc.mip_filter, desc.max_anisotropy),
@@ -1395,7 +1476,7 @@ create_sampler :: (device: *Device, desc: SamplerDesc) -> Sampler, bool {
     AddressW = sampler_addressing_to_d3d12(desc.address_w, u),
     MaxAnisotropy = desc.max_anisotropy,
   };
-  return add_object(*device.samplers, .{ desc = d3d12_desc }), true;
+  return add_object(*d3d12_device.samplers, .{ desc = d3d12_desc }), true;
 }
 
 name_object :: inline (obj: *ID3D12Object, name: string) {

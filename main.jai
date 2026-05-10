@@ -107,33 +107,33 @@ main :: () {
     return;
   }
 
-  swapchain, result = create_swapchain(*device, SwapchainDesc.{ hwnd = hwnd, width = width, height = height, });
+  swapchain, result = create_swapchain(device, SwapchainDesc.{ hwnd = hwnd, width = width, height = height, });
 
   if !result {
     return;
   }
 
-  compute_shader := load_shader_binary(*device, "compute.dxil");
-  compute_pipeline := create_compute_pipeline(*device, .{ cs = compute_shader, });
+  compute_shader := load_shader_binary(device, "compute.dxil");
+  compute_pipeline := create_compute_pipeline(device, .{ cs = compute_shader, });
 
-  triangle_vs := load_shader_binary(*device, "triangle_vs.dxil");
-  triangle_ps := load_shader_binary(*device, "triangle_ps.dxil");
+  triangle_vs := load_shader_binary(device, "triangle_vs.dxil");
+  triangle_ps := load_shader_binary(device, "triangle_ps.dxil");
 
-  triangle_root_signature := create_root_signature(*device, triangle_vs);
+  triangle_root_signature := create_root_signature(device, triangle_vs);
 
-  triangle_pipeline := create_graphics_pipeline(*device, .{
+  triangle_pipeline := create_graphics_pipeline(device, .{
     root_siganture = triangle_root_signature,
     vs = triangle_vs,
     ps = triangle_ps,
     render_target_formats = .[ .r8g8b8a8_unorm_srgb, ],
   });
 
-  forward_vs := load_shader_binary(*device, "forward_vs.dxil");
-  forward_ps := load_shader_binary(*device, "forward_ps.dxil");
+  forward_vs := load_shader_binary(device, "forward_vs.dxil");
+  forward_ps := load_shader_binary(device, "forward_ps.dxil");
 
-  forward_root_signature := create_root_signature(*device, forward_vs);
+  forward_root_signature := create_root_signature(device, forward_vs);
 
-  forward_pipeline := create_graphics_pipeline(*device, .{
+  forward_pipeline := create_graphics_pipeline(device, .{
     root_siganture = forward_root_signature,
     vs = forward_vs,
     ps = forward_ps,
@@ -152,25 +152,25 @@ main :: () {
   });
 
   heap_size: u64 = 2 * 1024 * 1024 * 1024;
-  gpu_heap := create_memory_heap(*device, .{ heap_type = .DEFAULT, size = heap_size, });
-  init(*resource_allocator, *device, gpu_heap, heap_size);
+  gpu_heap := create_memory_heap(device, .{ heap_type = .DEFAULT, size = heap_size, });
+  init(*resource_allocator, device, gpu_heap, heap_size);
 
-  upload_heap := create_memory_heap(*device, .{ heap_type = .UPLOAD, size = (128 * 1024 * 1024) * 2, });
+  upload_heap := create_memory_heap(device, .{ heap_type = .UPLOAD, size = (128 * 1024 * 1024) * 2, });
   upload_resource_allocator: ResourceAllocator;
-  init(*upload_resource_allocator, *device, upload_heap, (128 * 1024 * 1024) * 3);
+  init(*upload_resource_allocator, device, upload_heap, (128 * 1024 * 1024) * 3);
 
-  descriptor_heap := create_descriptor_heap(*device, .{ type = .Resource, descriptor_count = 4096, });
-  sampler_heap := create_descriptor_heap(*device, .{ type = .Sampler, descriptor_count = 2048, });
+  descriptor_heap := create_descriptor_heap(device, .{ type = .Resource, descriptor_count = 4096, });
+  sampler_heap := create_descriptor_heap(device, .{ type = .Sampler, descriptor_count = 2048, });
 
   upload_buffer = create_buffer(*upload_resource_allocator, .{
     size = 128 * 1024 * 1024,
   });
-  upload_ptr = map(*device, upload_buffer);
-  upload_cmd = create_cmd(*device);
+  upload_ptr = map(device, upload_buffer);
+  upload_cmd = create_cmd(device);
 
-  sampler := create_sampler(*device, .{ address_u = .MirroredRepeat, });
+  sampler := create_sampler(device, .{ address_u = .MirroredRepeat, });
 
-  update_descriptors(*device, sampler_heap, .[.{ type = .Sampler, heap_offset = 0, handle = sampler, },]);
+  update_descriptors(device, sampler_heap, .[.{ type = .Sampler, heap_offset = 0, handle = sampler, },]);
 
   albedo_stub := create_texture(*resource_allocator, .{
     format = .r8g8b8a8_unorm_srgb,
@@ -196,7 +196,7 @@ main :: () {
 
 
   scene, success := load_gltf_scene(.{
-    device = *device,
+    device = device,
     path = "sponza-gltf/source/Sponza.gltf",
     descriptor_heap = descriptor_heap,
     descriptor_heap_offset = 0,
@@ -204,7 +204,7 @@ main :: () {
     normal_stub = normal_stub,
     metallic_roughness_stub = metallic_roughness_stub,
   });
-  //scene, success := load_gltf_scene(*device, "DamagedHelmet/glTF/DamagedHelmet.gltf");
+  //scene, success := load_gltf_scene(device, "DamagedHelmet/glTF/DamagedHelmet.gltf");
 
   color_target := create_texture(*resource_allocator, .{
     format = .r8g8b8a8_unorm_srgb,
@@ -222,18 +222,18 @@ main :: () {
   });
 
   cpu_frame := CpuFrame.{
-    fence = create_fence(*device),
+    fence = create_fence(device),
   };
 
   for 0..gpu_frame_count - 1 {
     cpu_frame.gpu_frames[it] = .{
-      cmd = create_cmd(*device),
+      cmd = create_cmd(device),
       fence_value = 0,
     };
 
     buffer := create_buffer(*upload_resource_allocator, .{ size = 4 * 1024 * 1024, name = tprint("frame_%_constant_memory", it) });
 
-    init(*cpu_frame.gpu_frames[it].constant_mem_allocator, *device, buffer, 4 * 1024 * 1024);
+    init(*cpu_frame.gpu_frames[it].constant_mem_allocator, device, buffer, 4 * 1024 * 1024);
   }
 
 
@@ -243,33 +243,33 @@ main :: () {
   cube_ib := create_buffer(*resource_allocator, .{ size = cube_ib_size, name = "cube_ib" });
 
   {
-    begin(*upload_cmd);
+    begin(upload_cmd);
 
-    barrier(*upload_cmd, .None, .Copy, .[]);
+    barrier(upload_cmd, .None, .Copy, .[]);
     memcpy(upload_ptr, cube_vertices.data, xx cube_vb_size);
-    copy(*upload_cmd, BufferCopy.{
+    copy(upload_cmd, BufferCopy.{
       dst = cube_vb,
       dst_offset = 0,
       src = upload_buffer,
       src_offset = 0,
       size = cube_vb_size,
     });
-    end(*upload_cmd);
-    submit(*device, *upload_cmd);
-    wait_for_completion(*device);
+    end(upload_cmd);
+    submit(device, upload_cmd);
+    wait_for_completion(device);
 
-    begin(*upload_cmd);
+    begin(upload_cmd);
     memcpy(upload_ptr, cube_indices.data, xx cube_ib_size);
-    copy(*upload_cmd, BufferCopy.{
+    copy(upload_cmd, BufferCopy.{
       dst = cube_ib,
       dst_offset = 0,
       src = upload_buffer,
       src_offset = 0,
       size = cube_ib_size,
     });
-    end(*upload_cmd);
-    submit(*device, *upload_cmd);
-    wait_for_completion(*device);
+    end(upload_cmd);
+    submit(device, upload_cmd);
+    wait_for_completion(device);
   }
 
 
@@ -331,7 +331,7 @@ main :: () {
       using cpu_frame;
       gpu_frame := *gpu_frames[gpu_frame_index];
       using gpu_frame;
-      wait_for_fence(*device, *fence, fence_value);
+      wait_for_fence(device, *fence, fence_value);
       swapchain_texture := get_next_texture(*swapchain);
       reset(*constant_mem_allocator);
 
@@ -351,32 +351,32 @@ main :: () {
       cs := global_cb.projection * vs;
       ndc := cs / cs.w;
 
-      begin(*cmd);
+      begin(cmd);
 
-      set_descriptor_heaps(*cmd, .[ descriptor_heap, sampler_heap ]);
+      set_descriptor_heaps(cmd, .[ descriptor_heap, sampler_heap ]);
 
-      barrier(*cmd, .Present, .Raster | .Copy, .[
+      barrier(cmd, .Present, .Raster | .Copy, .[
         .{ texture = swapchain_texture, before = .Present, after = .CopyTarget, },
         .{ texture = color_target, before = .Undefined, after = .RenderTarget, },
         .{ texture = depth_target, before = .Undefined, after = .DepthStencilTarget, },
         ]
       );
 
-      set_viewport(*cmd, .{ width = width, height = height });
-      set_scissor(*cmd, .{ width = width, height = height });
-      clear_render_target(*cmd, color_target, .{ });
-      clear_depth_stencil_target(*cmd, depth_target, .{ depth = 1.0, });
+      set_viewport(cmd, .{ width = width, height = height });
+      set_scissor(cmd, .{ width = width, height = height });
+      clear_render_target(cmd, color_target, .{ });
+      clear_depth_stencil_target(cmd, depth_target, .{ depth = 1.0, });
 
-      set_targets(*cmd, .[color_target], depth_target);
+      set_targets(cmd, .[color_target], depth_target);
 
-      set_root_signature(*cmd, forward_root_signature);
-      set_pipeline(*cmd, forward_pipeline);
-      set_index_buffer(*cmd, scene.index_stream, scene.index_type, 0);
-      set_vertex_buffers(*cmd, 0, .[.{ buffer = scene.position_stream, stride = size_of(float) * 3 }, .{ buffer = scene.attribute_stream, stride = size_of(float) * (9 - 4) }]);
-      set_root_cbv(*cmd, xx RootIndex.Globals, constant_mem_allocator.buffer, xx global_cb_allocation.offset);
-      set_root_srv(*cmd, xx RootIndex.Submeshes, scene.submesh_stream, 0);
-      set_root_srv(*cmd, xx RootIndex.Materials, scene.material_stream, 0);
-      set_root_srv(*cmd, xx RootIndex.Transforms, scene.transform_stream, 0);
+      set_root_signature(cmd, forward_root_signature);
+      set_pipeline(cmd, forward_pipeline);
+      set_index_buffer(cmd, scene.index_stream, scene.index_type, 0);
+      set_vertex_buffers(cmd, 0, .[.{ buffer = scene.position_stream, stride = size_of(float) * 3 }, .{ buffer = scene.attribute_stream, stride = size_of(float) * (9 - 4) }]);
+      set_root_cbv(cmd, xx RootIndex.Globals, constant_mem_allocator.buffer, xx global_cb_allocation.offset);
+      set_root_srv(cmd, xx RootIndex.Submeshes, scene.submesh_stream, 0);
+      set_root_srv(cmd, xx RootIndex.Materials, scene.material_stream, 0);
+      set_root_srv(cmd, xx RootIndex.Transforms, scene.transform_stream, 0);
 
       for node, node_index: scene.nodes {
         DrawData :: struct {
@@ -392,40 +392,40 @@ main :: () {
           };
 
 
-          set_root_constants(*cmd, xx RootIndex.DrawData, draw_data);
-          draw_indexed(*cmd, submesh.index_count, 1, submesh.first_index, submesh.first_vertex, 0);
+          set_root_constants(cmd, xx RootIndex.DrawData, draw_data);
+          draw_indexed(cmd, submesh.index_count, 1, submesh.first_index, submesh.first_vertex, 0);
         }
       }
 
-      barrier(*cmd, .Raster, .Copy, .[.{ texture = color_target, before = .RenderTarget, after = .CopySource, }]);
+      barrier(cmd, .Raster, .Copy, .[.{ texture = color_target, before = .RenderTarget, after = .CopySource, }]);
 
-      copy(*cmd, TextureCopy.{
+      copy(cmd, TextureCopy.{
         dst = swapchain_texture,
         src =  color_target,
         width = width,
         height = height,
       });
 
-      barrier(*cmd, .Copy, .Present, .[.{ texture = swapchain_texture, before = .CopyTarget, after = .Present, }]);
+      barrier(cmd, .Copy, .Present, .[.{ texture = swapchain_texture, before = .CopyTarget, after = .Present, }]);
 
-      end(*cmd);
-      submit(*device, *cmd);
+      end(cmd);
+      submit(device, cmd);
       fence_value = next_value(*fence);
-      signal(*device, *fence, fence_value);
+      signal(device, *fence, fence_value);
       present(*swapchain);
       gpu_frame_index = (gpu_frame_index + 1) % gpu_frame_count;
   }
 
   for 0..gpu_frame_count - 1 {
     gpu_frame := *cpu_frame.gpu_frames[it];
-    wait_for_fence(*device, *cpu_frame.fence, gpu_frame.fence_value);
-    destroy(*device, *gpu_frame.cmd);
+    wait_for_fence(device, *cpu_frame.fence, gpu_frame.fence_value);
+    destroy(device, gpu_frame.cmd);
   }
 
-  destroy(*device, *cpu_frame.fence);
+  destroy(device, *cpu_frame.fence);
 
   destroy(*swapchain);
-  destroy(*device);
+  destroy(device);
 }
 
 // Input
@@ -530,7 +530,7 @@ cgltf_calc_size :: (accessor: cgltf_accessor) -> u64 {
 }
 
 GltfLoadDesc :: struct {
-  device: *Device;
+  device: Device;
   path: string;
   descriptor_heap: DescriptorHeap;
   descriptor_heap_offset: u64;
@@ -934,8 +934,8 @@ load_gltf_scene :: (using load_desc: GltfLoadDesc) -> Scene, bool {
       dst += 1;
       descriptor_offset += 3;
     }
-    begin(*upload_cmd);
-    copy(*upload_cmd, BufferCopy.{
+    begin(upload_cmd);
+    copy(upload_cmd, BufferCopy.{
         dst = material_stream,
         dst_offset = 0,
         src = upload_buffer,
@@ -943,8 +943,8 @@ load_gltf_scene :: (using load_desc: GltfLoadDesc) -> Scene, bool {
         size = xx (materials.count * size_of(u32)),
     });
 
-    end(*upload_cmd);
-    submit(device, *upload_cmd);
+    end(upload_cmd);
+    submit(device, upload_cmd);
     wait_for_completion(device);
   }
 
@@ -954,8 +954,8 @@ load_gltf_scene :: (using load_desc: GltfLoadDesc) -> Scene, bool {
     for submeshes {
       ptr[it_index] = it.material_id;
     }
-    begin(*upload_cmd);
-    copy(*upload_cmd, BufferCopy.{
+    begin(upload_cmd);
+    copy(upload_cmd, BufferCopy.{
         dst = submesh_stream,
         dst_offset = 0,
         src = upload_buffer,
@@ -963,8 +963,8 @@ load_gltf_scene :: (using load_desc: GltfLoadDesc) -> Scene, bool {
         size = xx (submeshes.count * size_of(u32)),
     });
 
-    end(*upload_cmd);
-    submit(device, *upload_cmd);
+    end(upload_cmd);
+    submit(device, upload_cmd);
     wait_for_completion(device);
   }
 
@@ -977,8 +977,8 @@ load_gltf_scene :: (using load_desc: GltfLoadDesc) -> Scene, bool {
         dst[it_index] = it.xyz;
       }
     }
-    begin(*upload_cmd);
-    copy(*upload_cmd, BufferCopy.{
+    begin(upload_cmd);
+    copy(upload_cmd, BufferCopy.{
         dst = transform_stream,
         dst_offset = 0,
         src = upload_buffer,
@@ -986,8 +986,8 @@ load_gltf_scene :: (using load_desc: GltfLoadDesc) -> Scene, bool {
         size = xx (nodes.count * size_of(Vector3) * 4),
     });
 
-    end(*upload_cmd);
-    submit(device, *upload_cmd);
+    end(upload_cmd);
+    submit(device, upload_cmd);
     wait_for_completion(device);
   }
 
@@ -1024,7 +1024,7 @@ accessor_copy_info_from_accessor :: inline (accessor: *cgltf_accessor, dst_eleme
   };
 }
 
-upload_primitive_data :: (device: *Device, dst_buffer: Buffer, dst_offset: u64, accessors: []AccessorCopyInfo, log: bool = false) -> u64 {
+upload_primitive_data :: (device: Device, dst_buffer: Buffer, dst_offset: u64, accessors: []AccessorCopyInfo, log: bool = false) -> u64 {
   dst := upload_ptr;
 
   element_count: u64 = accessors[0].accessor.count;
@@ -1051,9 +1051,9 @@ upload_primitive_data :: (device: *Device, dst_buffer: Buffer, dst_offset: u64, 
     }
   }
 
-  begin(*upload_cmd);
+  begin(upload_cmd);
 
-  copy(*upload_cmd, BufferCopy.{
+  copy(upload_cmd, BufferCopy.{
       dst = dst_buffer,
       dst_offset = dst_offset,
       src = upload_buffer,
@@ -1065,8 +1065,8 @@ upload_primitive_data :: (device: *Device, dst_buffer: Buffer, dst_offset: u64, 
     print("upload % bytes % offset\n", dst_element_size * element_count, accessors[0].data);
   }
 
-  end(*upload_cmd);
-  submit(device, *upload_cmd);
+  end(upload_cmd);
+  submit(device, upload_cmd);
   wait_for_completion(device);
 
   return element_count * dst_element_size;
@@ -1090,7 +1090,7 @@ CpuFrame :: struct
   gpu_frame_index: u32;
 }
 
-load_shader_binary :: (device: *Device, path: string) -> Shader, bool {
+load_shader_binary :: (device: Device, path: string) -> Shader, bool {
   auto_release_temp();
   compiled_shader_dir :: "compiled-shaders";
   bytecode, success := read_entire_file(path_join(compiled_shader_dir, path,, allocator=temp));
@@ -1129,7 +1129,7 @@ free_image :: (image: Image) {
   stbi_image_free(image.pixels);
 }
 
-upload_image :: (device: *Device, image: Image, in_texture_desc: TextureDesc) -> Texture, bool {
+upload_image :: (device: Device, image: Image, in_texture_desc: TextureDesc) -> Texture, bool {
   texture_desc := in_texture_desc;
   texture_desc.width = image.width;
   texture_desc.height = image.height;
@@ -1152,21 +1152,21 @@ upload_image :: (device: *Device, image: Image, in_texture_desc: TextureDesc) ->
     src += row_size;
   }
 
-  begin(*upload_cmd);
+  begin(upload_cmd);
 
-  barrier(*upload_cmd, .None, .Copy, .[.{ texture = texture, before = .Undefined, after = .CopyTarget}]);
+  barrier(upload_cmd, .None, .Copy, .[.{ texture = texture, before = .Undefined, after = .CopyTarget}]);
 
-  copy(*upload_cmd, BufferToTextureCopy.{
+  copy(upload_cmd, BufferToTextureCopy.{
     buffer = upload_buffer,
     texture = texture,
     width = image.width,
     height = image.height,
   });
 
-  barrier(*upload_cmd, .Copy, .Pixel | .Compute, .[.{ texture = texture, before = .CopyTarget, after = .ShaderResource}]);
+  barrier(upload_cmd, .Copy, .Pixel | .Compute, .[.{ texture = texture, before = .CopyTarget, after = .ShaderResource}]);
 
-  end(*upload_cmd);
-  submit(device, *upload_cmd);
+  end(upload_cmd);
+  submit(device, upload_cmd);
   wait_for_completion(device);
 
   return texture, true;
@@ -1201,17 +1201,17 @@ Image :: struct {
 ResourceAllocator :: struct {
   offset_allocator: LinearAllocator;
   memory_heap: MemoryHeap;
-  device: *Device;
+  device: Device;
 }
 
 DescriptorAllocator :: struct {
   offset_allocator: LinearAllocator;
   base_offset: u32;
   descriptor_heap: DescriptorHeap;
-  device: *Device;
+  device: Device;
 }
 
-init :: (allocator: *ResourceAllocator, device: *Device, heap: MemoryHeap, size: u64) {
+init :: (allocator: *ResourceAllocator, device: Device, heap: MemoryHeap, size: u64) {
   init(*allocator.offset_allocator, size);
   allocator.device = device;
   allocator.memory_heap = heap;
@@ -1235,7 +1235,7 @@ create_buffer :: (using allocator: *ResourceAllocator, buffer_desc: BufferDesc) 
   return buffer, success;
 }
 
-init :: (allocator: *DescriptorAllocator, device: *Device, heap: DescriptorHeap, descriptor_count: u32, base_offset: u32) {
+init :: (allocator: *DescriptorAllocator, device: Device, heap: DescriptorHeap, descriptor_count: u32, base_offset: u32) {
   init(*allocator.offset_allocator, descriptor_count);
   allocator.device = device;
   allocator.descriptor_heap = heap;
@@ -1256,7 +1256,7 @@ BufferMemoryAllocator :: struct {
   base_ptr: *u8;
 }
 
-init :: (using allocator: *BufferMemoryAllocator, device: *Device, in_buffer: Buffer, in_size: s64, in_base_offset: s64 = 0) {
+init :: (using allocator: *BufferMemoryAllocator, device: Device, in_buffer: Buffer, in_size: s64, in_base_offset: s64 = 0) {
   allocator.* = .{};
   buffer = in_buffer;
   size = in_size;

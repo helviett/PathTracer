@@ -1,3 +1,5 @@
+Device         :: #type, isa Handle;
+Cmd            :: #type, isa Handle;
 Sampler        :: #type, isa Handle;
 Texture        :: #type, isa Handle;
 Buffer         :: #type, isa Handle;
